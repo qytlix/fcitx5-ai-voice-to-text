@@ -30,6 +30,13 @@ Fcitx5 AI Voice-to-Text Core — 语音输入 → ASR 转文字 → AI 风格化
 | `asr.py` | 音频 → 文字（当前固定模拟） |
 | `stylize.py` | 文字 → 风格化（当前规则模拟，支持正式/精简/礼貌/翻译_英文/自定义） |
 
+## Environment
+
+- **Android SDK**: `~/Android/Sdk`
+- **Java**: Java 17
+- **Python**: Conda env `v2t`
+- **项目路径**: `~/Documents/ECNU/Studys/k课程/设计思维/Fcitx5-ai-voice-to-text-core/`
+
 ## Commands
 
 ```bash
@@ -38,6 +45,20 @@ conda activate v2t
 
 # 启动服务端（开发模式，带热重载）
 uvicorn server.app:app --reload --host 0.0.0.0 --port 8080
+
+# 构建 Android APK
+cd client
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:assembleDebug
+
+# 运行单元测试
+cd client
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :core:test
+
+# 安装 APK 到设备
+adb install client/app/build/outputs/apk/debug/app-debug.apk
+
+# USB 反向代理（真机测试用）
+adb reverse tcp:8080 tcp:8080
 
 # 测试健康检查
 curl http://localhost:8080/health
