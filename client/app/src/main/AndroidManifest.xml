@@ -19,6 +19,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Fcitx5 语音输入插件 Service -->
+        <service
+            android:name=".bridge.VoiceInputPluginService"
+            android:exported="true"
+            android:process=":fcitx_plugin_voice"
+            android:description="@string/plugin_description">
+            <intent-filter>
+                <action android:name="org.fcitx.fcitx5.android.plugin.SERVICE" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

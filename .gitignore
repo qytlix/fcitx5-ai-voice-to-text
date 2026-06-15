@@ -19,3 +19,6 @@ server/__pycache__/
 
 # Conda
 server/environment.yml
+
+# Git worktrees (temp server checkout)
+server_temp/

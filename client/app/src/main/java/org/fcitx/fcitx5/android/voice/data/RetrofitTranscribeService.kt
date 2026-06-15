@@ -25,7 +25,7 @@ class RetrofitTranscribeService(
      * - 真机 + 局域网: http://192.168.x.x:8080
      * - 真机 + USB 反向代理: http://localhost:8080（需 adb reverse tcp:8080 tcp:8080）
      */
-    baseUrl: String = "http://10.0.2.2:8080"
+    baseUrl: String = "http://192.168.1.108:8080"
 ) : TranscribeService {
 
     private val api: TranscribeApi

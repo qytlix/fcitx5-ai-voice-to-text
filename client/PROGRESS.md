@@ -9,7 +9,7 @@
 ```
 Phase 1: 纯 Kotlin 核心库 + 单元测试   ✅ 已完成
 Phase 2: Android 模块 (独立 App)       ✅ 已完成
-Phase 3: Fcitx5 插件适配               ⬜ 待开始
+Phase 3: Fcitx5 插件适配               ✅ 已完成
 Phase 4: 完善与优化                    ⬜ 待开始
 ```
 
@@ -90,7 +90,9 @@ client/app/
         │   ├── AndroidAudioRecorder.kt  # AudioRecord 实现
         │   └── RetrofitTranscribeService.kt  # Retrofit HTTP 客户端
         ├── bridge/
-        │   └── ClipboardCommitTextHandler.kt  # 剪贴板上屏
+        │   ├── ClipboardCommitTextHandler.kt  # 剪贴板上屏（独立 App 模式）
+        │   ├── NoOpCommitTextHandler.kt       # 无操作上屏（插件模式）
+        │   └── VoiceInputPluginService.kt     # Fcitx5 插件 Service
         └── ui/
             ├── VoiceInputViewModel.kt   # UI 状态管理
             └── MainActivity.kt          # 主界面
@@ -113,7 +115,7 @@ client/app/
                          ┌───────┼───────┐
                          │       │       │
                    AudioRecorder  │  CommitTextHandler
-                  (AndroidAudio)  │  (Clipboard)
+                  (AndroidAudio)  │  (Clipboard / NoOp)
                                   │
                      RetrofitTranscribeService
                                   │
@@ -132,49 +134,119 @@ client/app/
 
 ---
 
-## Phase 3 — Fcitx5 插件适配 ⬜
+## Phase 3 — Fcitx5 插件适配 ✅
 
 ### 目标
-将独立 App 改造为 Fcitx5 Android 插件，通过插件系统与 Fcitx5 主应用通信。
+将独立 App 改造为 Fcitx5 Android 插件，通过 AIDL IPC 与 Fcitx5 主应用通信。
 
-### 需要完成的工作
+### 架构
 
-#### 3.1 理解 Fcitx5 Android 插件机制
-- 参考 `clipboard-filter` 插件的实现模式
-- 插件通过 `FcitxPluginServices.PLUGIN_SERVICE_ACTION` 注册
-- 主应用启动时自动发现并绑定已安装的插件
-- 插件作为独立 APK，通过 AIDL IPC 与主应用通信
-
-#### 3.2 创建 AIDL 接口
 ```
-client/app/src/main/aidl/.../voice/
-├── IVoiceInputPlugin.aidl       # 插件 → 主应用：启动/停止录音
-└── IVoiceInputCallback.aidl     # 主应用 → 插件：状态/结果回调
+Fcitx5 主应用（独立 APK）                   语音输入插件（本 APK）
+┌──────────────────────┐          AIDL     ┌─────────────────────────┐
+│ InputMethodService   │ ◄─────────────── ► │ VoiceInputPluginService │
+│                      │   IVoiceInputPlugin│                         │
+│  ┌───────────────┐   │   startRecording() │  ┌─────────────────┐   │
+│  │ voice button  │───┼───────────────────►│  │ AndroidAudio-   │   │
+│  └───────┬───────┘   │                    │  │ Recorder        │   │
+│          │           │                    │  └────────┬────────┘   │
+│  onResult(text) ◄────┼────────────────────┼───────────┘            │
+│          │           │                    │  ┌─────────────────┐   │
+│          ▼           │   onResult(text)   │  │ RetrofitTrans-  │   │
+│  InputConnection     │◄────────────────────│  │ cribeService    │   │
+│  .commitText(text,1) │                    │  └────────┬────────┘   │
+└──────────────────────┘                    │           │            │
+                                            │  POST /v1/transcribe   │
+                                            │           │            │
+                                            │  ┌────────▼────────┐   │
+                                            │  │ NoOpCommitText  │   │
+                                            │  │ Handler(no-op)  │   │
+                                            │  └─────────────────┘   │
+                                            └─────────────────────────┘
 ```
 
-#### 3.3 实现 Fcitx5 插件 Service
-- `VoiceInputPluginService` — 继承 Service，注册为 Fcitx5 插件
-- 实现 AIDL 接口，处理主应用的语音输入请求
-- 复用 Phase 2 的 `TranscribeUseCase` 等核心逻辑
+- 插件负责录音（AudioRecord）和 HTTP 请求（Retrofit），复用 Phase 2 的全部核心逻辑
+- 文本上屏通过 AIDL 回调 `IVoiceInputCallback.onResult()` 委托给 Fcitx5 主应用
+- 主应用在回调中调用 `InputConnection.commitText()` 完成上屏
+- 插件内使用 `NoOpCommitTextHandler`（空操作），因为真正的上屏在主应用侧
 
-#### 3.4 实现 Fcitx5 上屏
-- `Fcitx5CommitTextHandler` — 替换 `ClipboardCommitTextHandler`
-- 通过 `InputConnection.commitText()` 实现真正的输入法上屏
-- 支持 `setComposingText()` 实时预览
+### 创建/修改的文件
 
-#### 3.5 主应用端修改（Fcitx5 Android 源码）
-- 在键盘布局中添加"语音输入"按钮
-- 点击按钮通过 AIDL 调用插件
-- 接收回调更新 UI 状态
+#### 新增 4 个文件
 
-#### 3.6 关键文件
 | 文件 | 说明 |
 |------|------|
-| `app/src/main/aidl/IVoiceInputPlugin.aidl` | 插件 AIDL 接口 |
-| `app/src/main/aidl/IVoiceInputCallback.aidl` | 回调 AIDL 接口 |
-| `app/src/main/java/.../bridge/VoiceInputPluginService.kt` | 插件 Service |
-| `app/src/main/java/.../bridge/Fcitx5CommitTextHandler.kt` | Fcitx5 上屏实现 |
-| `app/src/main/AndroidManifest.xml` | 添加插件 service 声明 |
+| `app/src/main/aidl/org/fcitx/fcitx5/android/voice/IVoiceInputPlugin.aidl` | 插件 AIDL 接口：startRecording, stopRecording, cancelRecording, setStyle, registerCallback, isRecording, getVersion |
+| `app/src/main/aidl/org/fcitx/fcitx5/android/voice/IVoiceInputCallback.aidl` | 回调 AIDL 接口：onResult, onError, onStateChanged + STATE_IDLE/RECORDING/PROCESSING 常量 |
+| `app/src/main/java/.../bridge/VoiceInputPluginService.kt` | 插件 Service：实现 AIDL，协程管理录音/HTTP/回调生命周期 |
+| `app/src/main/java/.../bridge/NoOpCommitTextHandler.kt` | 无操作上屏 Handler（上屏由主应用在 AIDL 回调中处理） |
+
+#### 修改 3 个文件
+
+| 文件 | 变更 |
+|------|------|
+| `app/src/main/AndroidManifest.xml` | 添加 VoiceInputPluginService 声明 + `org.fcitx.fcitx5.android.plugin.SERVICE` intent filter + 独立进程 `:fcitx_plugin_voice` |
+| `app/build.gradle.kts` | `buildFeatures { aidl = true }` |
+| `app/src/main/res/values/strings.xml` | 添加 `plugin_description` |
+
+### AIDL 接口详情
+
+**IVoiceInputPlugin.aidl** — 插件暴露给主应用的接口：
+
+```aidl
+interface IVoiceInputPlugin {
+    void startRecording();              // 开始录音
+    void stopRecording();               // 停止录音 → 转录 → 回调
+    void cancelRecording();             // 取消（丢弃音频）
+    void setStyle(String style);        // 设置风格
+    void registerCallback(IVoiceInputCallback callback);  // 注册回调
+    boolean isRecording();              // 查询状态
+    String getVersion();                // 获取版本
+}
+```
+
+**IVoiceInputCallback.aidl** — 主应用实现的回调接口：
+
+```aidl
+interface IVoiceInputCallback {
+    void onResult(String text, String originalText, long durationMs);
+    void onError(String message);
+    void onStateChanged(int state);     // STATE_IDLE=0 / STATE_RECORDING=1 / STATE_PROCESSING=2
+}
+```
+
+### 插件 Service 数据流
+
+```
+startRecording() → audioRecorder.startRecording()  [直接调用 AudioRecorder]
+stopRecording()  → audioRecorder.stopRecording() → 获取 base64 WAV
+                 → TranscribeUseCase.execute(audioSource=base64)  [跳过录音，走 HTTP]
+                 → callback.onResult(text, originalText, durationMs)
+                 → Fcitx5 主应用: InputConnection.commitText(text, 1)
+cancelRecording() → 清除状态，丢弃音频
+```
+
+### 构建验证
+
+| 项目 | 状态 |
+|------|------|
+| `./gradlew :core:test` | ✅ 17/17 通过（core 模块未改动） |
+| `./gradlew :app:assembleDebug` | ✅ 成功，AIDL 编译通过 |
+| APK service 声明 | ✅ 包含 `VoiceInputPluginService` + intent filter + 独立进程 |
+| AIDL 桩代码生成 | ✅ `IVoiceInputPlugin.java` + `IVoiceInputCallback.java` |
+
+### 主应用侧修改（不在本项目范围内）
+
+Fcitx5 Android 源码需要做的修改（记录供参考）：
+
+1. 在键盘布局中添加语音输入按钮
+2. 在 `InputMethodService` 中绑定插件（bindService → 通过 AIDL 控制）
+3. 实现 `IVoiceInputCallback.Stub`：`onResult()` 中调用 `InputConnection.commitText()`
+4. 将两个 AIDL 文件拷贝到 Fcitx5 Android 项目或通过 APK 依赖引用
+
+---
+
+## Phase 4 — 完善与优化 ⬜
 
 ---
 
