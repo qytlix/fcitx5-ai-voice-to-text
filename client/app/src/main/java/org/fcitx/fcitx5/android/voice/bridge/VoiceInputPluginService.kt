@@ -7,6 +7,7 @@ import android.util.Log
 import kotlinx.coroutines.*
 import org.fcitx.fcitx5.android.voice.IVoiceInputCallback
 import org.fcitx.fcitx5.android.voice.IVoiceInputPlugin
+import org.fcitx.fcitx5.android.voice.core.bridge.SessionIdProvider
 import org.fcitx.fcitx5.android.voice.core.domain.TranscribeUseCase
 import org.fcitx.fcitx5.android.voice.core.network.TranscribeException
 import org.fcitx.fcitx5.android.voice.data.AndroidAudioRecorder
@@ -47,10 +48,16 @@ class VoiceInputPluginService : Service() {
         private const val TAG = "VoiceInputPluginService"
 
         /** 插件版本号（语义化版本） */
-        private const val PLUGIN_VERSION = "0.1.0"
+        private const val PLUGIN_VERSION = "0.2.0"
 
         /** 默认转录风格 */
         private const val DEFAULT_STYLE = "正式"
+
+        /** SharedPreferences 文件名 */
+        private const val PREFS_NAME = "voice_input_plugin_prefs"
+
+        /** 风格持久化 key */
+        private const val KEY_CURRENT_STYLE = "pref_current_style"
     }
 
     // --- 依赖 ---
@@ -62,6 +69,7 @@ class VoiceInputPluginService : Service() {
         transcribeService = transcribeService,
         commitTextHandler = commitTextHandler
     )
+    private val sessionIdProvider: SessionIdProvider = SessionIdProvider.DEFAULT
 
     // --- 并发控制 ---
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -73,13 +81,29 @@ class VoiceInputPluginService : Service() {
     @Volatile
     private var callback: IVoiceInputCallback? = null
 
-    /** 当前选中的风格 */
+    /** 当前选中的风格（持久化到 SharedPreferences） */
     @Volatile
     private var currentStyle: String = DEFAULT_STYLE
+
+    /** 当前会话 ID（startRecording 时生成，stopRecording 回调时携带） */
+    @Volatile
+    private var currentSessionId: String? = null
 
     /** 是否正在录音 */
     @Volatile
     private var _isRecording = false
+
+    /** SharedPreferences（延迟初始化，onCreate 时可用） */
+    private val prefs by lazy {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        // 恢复持久化的风格设置
+        currentStyle = prefs.getString(KEY_CURRENT_STYLE, DEFAULT_STYLE) ?: DEFAULT_STYLE
+        Log.d(TAG, "Service 创建，恢复风格: $currentStyle")
+    }
 
     /**
      * AIDL Binder 实现。
@@ -96,11 +120,15 @@ class VoiceInputPluginService : Service() {
                 return
             }
 
+            // 生成新会话 ID
+            currentSessionId = sessionIdProvider.generateSessionId()
+            Log.d(TAG, "新会话: $currentSessionId")
+
             transcribeJob = serviceScope.launch {
                 try {
                     _isRecording = true
                     updateState(IVoiceInputCallback.STATE_RECORDING)
-                    Log.d(TAG, "开始录音 (style=$currentStyle)")
+                    Log.d(TAG, "开始录音 (style=$currentStyle, session=$currentSessionId)")
 
                     // 直接调用 AudioRecorder 开始录音
                     // 整个过程在协程中，startRecording() 内部切换到 IO 线程
@@ -108,6 +136,7 @@ class VoiceInputPluginService : Service() {
 
                 } catch (e: Exception) {
                     _isRecording = false
+                    currentSessionId = null
                     updateState(IVoiceInputCallback.STATE_IDLE)
                     Log.e(TAG, "启动录音失败", e)
                     callback?.onError("录音启动失败: ${e.message}")
@@ -142,16 +171,19 @@ class VoiceInputPluginService : Service() {
                     // 传入 audioSource 参数跳过录音环节，直接使用刚获取的音频
                     val result = transcribeUseCase.execute(
                         style = currentStyle,
-                        audioSource = audioBase64
+                        audioSource = audioBase64,
+                        sessionId = currentSessionId
                     )
 
                     Log.d(TAG, "转录成功: ${result.text} (${result.totalDurationMs}ms)")
 
                     // 通过 AIDL 回调将结果送达主应用
+                    val sid = currentSessionId ?: ""
                     callback?.onResult(
                         result.text,
                         result.originalText,
-                        result.totalDurationMs
+                        result.totalDurationMs,
+                        sid
                     )
 
                 } catch (e: TranscribeException) {
@@ -174,12 +206,15 @@ class VoiceInputPluginService : Service() {
             transcribeJob?.cancel()
             transcribeJob = null
             _isRecording = false
+            currentSessionId = null
             updateState(IVoiceInputCallback.STATE_IDLE)
         }
 
         override fun setStyle(style: String) {
             Log.d(TAG, "setStyle: $style")
             currentStyle = style
+            // 持久化到 SharedPreferences
+            prefs.edit().putString(KEY_CURRENT_STYLE, style).apply()
         }
 
         override fun registerCallback(callback: IVoiceInputCallback?) {

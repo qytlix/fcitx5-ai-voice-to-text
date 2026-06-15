@@ -18,7 +18,7 @@ interface IVoiceInputCallback {
      * @param originalText ASR 原始转写
      * @param durationMs 总耗时（毫秒）
      */
-    void onResult(String text, String originalText, long durationMs);
+    void onResult(String text, String originalText, long durationMs, String sessionId);
 
     /**
      * 转录过程出错。

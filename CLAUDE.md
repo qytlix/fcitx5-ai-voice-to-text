@@ -25,10 +25,11 @@ Fcitx5 AI Voice-to-Text Core — 语音输入 → ASR 转文字 → AI 风格化
 
 | 模块 | 职责 |
 |---|---|
-| `app.py` | FastAPI 入口，/health GET + /v1/transcribe POST |
-| `models.py` | TranscribeRequest / TranscribeResponse Pydantic 模型 |
+| `app.py` | FastAPI 入口，/health GET + /v1/transcribe POST + /v1/feedback POST + /v1/feedback/count GET |
+| `models.py` | TranscribeRequest / TranscribeResponse / FeedbackRequest / FeedbackResponse Pydantic 模型 |
 | `asr.py` | 音频 → 文字（当前固定模拟） |
 | `stylize.py` | 文字 → 风格化（当前规则模拟，支持正式/精简/礼貌/翻译_英文/自定义） |
+| `feedback_store.py` | JSONL 文件存储（server/data/feedback.jsonl，append / list / rotate） |
 
 ## Environment
 
@@ -67,7 +68,16 @@ curl http://localhost:8080/health
 curl -X POST http://localhost:8080/v1/transcribe \
   -H "Content-Type: application/json" \
   -d '{"audio": "AAECAw==", "style": "正式"}'
+
+# 测试反馈接口
+curl -X POST http://localhost:8080/v1/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"original_text":"test","styled_text":"test","final_text":"edited","style":"正式","duration_ms":100}'
+
+# 查看反馈计数
+curl http://localhost:8080/v1/feedback/count
 ```
+
 
 ## API 接口
 

@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.fcitx.fcitx5.android.voice.core.bridge.SessionIdProvider
 import org.fcitx.fcitx5.android.voice.core.domain.TranscribeState
 import org.fcitx.fcitx5.android.voice.core.domain.TranscribeUseCase
 import org.fcitx.fcitx5.android.voice.core.network.TranscribeException
@@ -15,8 +16,8 @@ import org.fcitx.fcitx5.android.voice.core.network.TranscribeException
 /**
  * 语音输入 ViewModel — 管理 UI 状态与用户交互。
  *
- * 持有 [TranscribeUseCase] 的引用，通过 StateFlow 暴露 UI 状态。
- * UI 层 collect 此 Flow 来驱动视觉更新（按钮状态、结果展示、错误提示）。
+ * 支持长按录音、松手停止并发送的交互模式。
+ * 通过 StateFlow 暴露 UI 状态，UI 层 collect 此 Flow 来驱动视觉更新。
  *
  * 状态流转：
  *   Idle → Recording → Processing → Success / Error → Idle
@@ -28,6 +29,17 @@ class VoiceInputViewModel(
     companion object {
         private const val TAG = "VoiceInputViewModel"
     }
+
+    /**
+     * 转录会话元数据 — 用于反馈采集。
+     */
+    data class TranscriptionSession(
+        val sessionId: String,
+        val originalText: String,
+        val styledText: String,
+        val style: String,
+        val durationMs: Long
+    )
 
     private val _state = MutableStateFlow<TranscribeState>(TranscribeState.Idle)
     val state: StateFlow<TranscribeState> = _state.asStateFlow()
@@ -44,50 +56,56 @@ class VoiceInputViewModel(
     private val _lastOriginalText = MutableStateFlow<String?>(null)
     val lastOriginalText: StateFlow<String?> = _lastOriginalText.asStateFlow()
 
+    /** 最后一次转录的会话元数据（供反馈采集使用） */
+    private val _lastTranscriptionSession = MutableStateFlow<TranscriptionSession?>(null)
+    val lastTranscriptionSession: StateFlow<TranscriptionSession?> = _lastTranscriptionSession.asStateFlow()
+
     /** 当前正在执行的录音/转录任务 */
     private var currentJob: Job? = null
 
+    /** 当前会话 ID（录音开始时生成） */
+    private var currentSessionId: String? = null
+
+    /** 会话 ID 生成器 */
+    private val sessionIdProvider: SessionIdProvider = SessionIdProvider.DEFAULT
+
     /**
-     * 当用户点击"开始录音"按钮时调用。
+     * 长按按下 — 开始录音。
      *
-     * 如果当前是 Idle 状态 → 开始录音。
-     * 如果当前是 Recording 状态 → 停止录音并开始转录。
-     * 如果当前是 Error 状态 → 重置并开始录音。
+     * Idle / Error / Success 状态 → 启动录音。
+     * 其他状态忽略。
      */
-    fun onStartRecording() {
+    fun onPress() {
         val currentState = _state.value
         when (currentState) {
             is TranscribeState.Idle,
             is TranscribeState.Error,
+            is TranscribeState.Success -> {
+                startRecording()
+            }
             is TranscribeState.WaitingForPermission -> {
-                startTranscribeFlow()
+                Log.w(TAG, "等待权限中")
             }
             is TranscribeState.Recording -> {
-                // 已经在录音中（按钮应显示"停止"），见 onStopRecording
                 Log.w(TAG, "已经在录音中")
             }
-            is TranscribeState.Processing,
-            is TranscribeState.Success -> {
-                Log.w(TAG, "当前状态 ($currentState) 下不能开始录音")
+            is TranscribeState.Processing -> {
+                Log.w(TAG, "正在处理中")
             }
         }
     }
 
     /**
-     * 当用户点击"停止录音"按钮时调用。
+     * 松手释放 — 停止录音并发送 HTTP 转录。
+     *
+     * 仅在 Recording 状态有效。
      */
-    fun onStopRecording() {
-        val currentState = _state.value
-        if (currentState !is TranscribeState.Recording) {
-            Log.w(TAG, "当前不在录音状态，无法停止")
+    fun onRelease() {
+        if (_state.value !is TranscribeState.Recording) {
+            Log.w(TAG, "当前不在录音状态，忽略释放操作")
             return
         }
-        // 录音的停止在 TranscribeUseCase 内部处理，
-        // 此处通过取消当前 Job 来触发 stopRecording
-        currentJob?.cancel()
-        currentJob = null
-        // 启动转录流程（会自动停止录音）
-        startTranscribeFlow(wasRecording = true)
+        stopAndTranscribe()
     }
 
     /**
@@ -103,6 +121,13 @@ class VoiceInputViewModel(
     fun clearResult() {
         _lastResultText.value = null
         _lastOriginalText.value = null
+        _lastTranscriptionSession.value = null
+    }
+
+    /** 清除转录会话元数据（反馈已采集后调用） */
+    fun clearSession() {
+        _lastTranscriptionSession.value = null
+        currentSessionId = null
     }
 
     /**
@@ -113,19 +138,51 @@ class VoiceInputViewModel(
     }
 
     /**
-     * 启动完整转录流程（录音 → 发送 → 上屏）。
-     *
-     * @param wasRecording 是否已经处于录音中（用户点击停止时触发）
+     * 开始录音（长按按下时触发）。
      */
-    private fun startTranscribeFlow(wasRecording: Boolean = false) {
+    private fun startRecording() {
         currentJob?.cancel()
         currentJob = viewModelScope.launch {
             try {
-                _state.value = TranscribeState.Recording(durationMs = 0L)
-                Log.d(TAG, "开始录音 (style=${_currentStyle.value})")
+                // 生成新会话 ID
+                val sid = sessionIdProvider.generateSessionId()
+                currentSessionId = sid
 
-                val result = transcribeUseCase.execute(
-                    style = _currentStyle.value
+                _state.value = TranscribeState.Recording(durationMs = 0L)
+                Log.d(TAG, "开始录音 (style=${_currentStyle.value}, session=$sid)")
+
+                // 仅启动录音，不阻塞等待
+                transcribeUseCase.startRecording()
+
+                Log.d(TAG, "录音已启动，等待释放")
+            } catch (e: TranscribeException) {
+                val message = when (e) {
+                    is TranscribeException.RecordingFailed -> "录音启动失败"
+                    else -> "未知错误"
+                }
+                _state.value = TranscribeState.Error(message = message)
+                Log.e(TAG, "录音启动失败", e)
+            } catch (e: Exception) {
+                _state.value = TranscribeState.Error(message = "录音启动失败: ${e.message}")
+                Log.e(TAG, "录音启动异常", e)
+            }
+        }
+    }
+
+    /**
+     * 停止录音并执行转录（松手释放时触发）。
+     */
+    private fun stopAndTranscribe() {
+        currentJob?.cancel()
+        currentJob = viewModelScope.launch {
+            try {
+                _state.value = TranscribeState.Processing
+                Log.d(TAG, "停止录音，开始转录 (style=${_currentStyle.value})")
+
+                val sid = currentSessionId
+                val result = transcribeUseCase.stopRecordingAndTranscribe(
+                    style = _currentStyle.value,
+                    sessionId = sid
                 )
 
                 _state.value = TranscribeState.Success(
@@ -136,17 +193,26 @@ class VoiceInputViewModel(
                 _lastResultText.value = result.text
                 _lastOriginalText.value = result.originalText
 
-                Log.d(TAG, "转录成功: ${result.text} (${result.totalDurationMs}ms)")
+                // 记录转录会话元数据（供反馈采集）
+                _lastTranscriptionSession.value = TranscriptionSession(
+                    sessionId = sid ?: "",
+                    originalText = result.originalText,
+                    styledText = result.text,
+                    style = _currentStyle.value,
+                    durationMs = result.totalDurationMs
+                )
+
+                Log.d(TAG, "转录成功: ${result.text} (${result.totalDurationMs}ms, session=$sid)")
 
             } catch (e: TranscribeException) {
                 val message = when (e) {
-                    is TranscribeException.RecordingFailed -> "录音失败"
                     is TranscribeException.EncodingFailed -> "音频处理失败"
                     is TranscribeException.NetworkError -> "网络连接失败，请检查服务器"
                     is TranscribeException.ServerError -> "服务器错误 (${e.code})"
                     is TranscribeException.Timeout -> "请求超时，请重试"
                     is TranscribeException.ServerReturnedError -> "服务返回错误"
                     is TranscribeException.Unknown -> "未知错误"
+                    else -> "转录失败"
                 }
                 _state.value = TranscribeState.Error(message = message)
                 Log.e(TAG, "转录失败: $message", e)

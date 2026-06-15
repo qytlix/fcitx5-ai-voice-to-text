@@ -26,32 +26,52 @@ class TranscribeUseCase(
 ) {
 
     /**
-     * 执行一次完整的语音输入流程。
+     * 开始录音 — 两段式接口的第一段。
      *
-     * 流程：
-     *   1. 开始录音（若未提供外部音频）
-     *   2. 停止录音并编码为 base64 WAV
-     *   3. 发送 HTTP POST 到 /v1/transcribe
-     *   4. 收到响应后调用 [commitTextHandler] 上屏
-     *   5. 返回完整结果
+     * 调用后录音器会持续采集音频，直到调用 [stopRecordingAndTranscribe]。
+     * 适用于长按录音的交互模式。
+     *
+     * @throws TranscribeException.RecordingFailed 无法启动录音时
+     */
+    suspend fun startRecording() {
+        try {
+            audioRecorder.startRecording()
+        } catch (e: Exception) {
+            throw TranscribeException.RecordingFailed(
+                reason = "无法启动录音: ${e.message}",
+                cause = e
+            )
+        }
+    }
+
+    /**
+     * 停止录音并执行转录 — 两段式接口的第二段。
+     *
+     * 流程：停止录音编码 base64 → HTTP POST 转录 → 上屏
      *
      * @param style      风格选项（正式/精简/礼貌/翻译_英文/自定义）
      * @param prompt     自定义提示词
      * @param sample     样例文本（few-shot）
-     * @param audioSource 可选：直接传入 base64 音频（跳过录音环节）
      * @return 包含完整流程信息的 TranscribeResult
      * @throws TranscribeException 流程中的任何错误
      */
-    suspend fun execute(
+    suspend fun stopRecordingAndTranscribe(
         style: String = "正式",
         prompt: String? = null,
         sample: String? = null,
-        audioSource: String? = null
+        sessionId: String? = null
     ): TranscribeResult {
         val startTime = System.currentTimeMillis()
 
-        // Step 1: 获取音频数据
-        val audioBase64 = audioSource ?: recordAndEncode()
+        // Step 1: 停止录音并编码
+        val audioBase64 = try {
+            audioRecorder.stopRecording()
+        } catch (e: Exception) {
+            throw TranscribeException.EncodingFailed(
+                reason = "音频编码失败: ${e.message}",
+                cause = e
+            )
+        }
 
         // Step 2: 发送请求（含自动重试）
         val response = transcribeWithRetry(
@@ -77,31 +97,73 @@ class TranscribeUseCase(
             text = response.text,
             originalText = response.originalText,
             serverDurationMs = response.durationMs?.toLong(),
-            totalDurationMs = totalDuration
+            totalDurationMs = totalDuration,
+            sessionId = sessionId
         )
     }
 
     /**
-     * 录音并编码为 base64 WAV。
+     * 一站式执行：录音 → 发送 → 上屏。
+     *
+     * 内部调用 [startRecording] 立即 [stopRecordingAndTranscribe]。
+     * 适用于无需等待用户"停止"的场景（如外部音频输入、插件模式）。
+     *
+     * @param style      风格选项
+     * @param prompt     自定义提示词
+     * @param sample     样例文本
+     * @param audioSource 可选：直接传入 base64 音频（跳过录音环节）
+     * @return TranscribeResult
      */
-    private suspend fun recordAndEncode(): String {
-        try {
-            audioRecorder.startRecording()
-        } catch (e: Exception) {
-            throw TranscribeException.RecordingFailed(
-                reason = "无法启动录音: ${e.message}",
-                cause = e
+    suspend fun execute(
+        style: String = "正式",
+        prompt: String? = null,
+        sample: String? = null,
+        audioSource: String? = null,
+        sessionId: String? = null
+    ): TranscribeResult {
+        // 有外部音频源则跳过录音
+        if (audioSource != null) {
+            return transcribeAndCommit(audioSource, style, prompt, sample, sessionId)
+        }
+        // 否则执行录音 → 转录
+        startRecording()
+        return stopRecordingAndTranscribe(style, prompt, sample, sessionId)
+    }
+
+    /**
+     * 直接对已有音频 base64 执行转录和上屏（跳过录音）。
+     */
+    private suspend fun transcribeAndCommit(
+        audioBase64: String,
+        style: String,
+        prompt: String?,
+        sample: String?,
+        sessionId: String?
+    ): TranscribeResult {
+        val startTime = System.currentTimeMillis()
+
+        val response = transcribeWithRetry(
+            TranscribeRequest(
+                audio = audioBase64,
+                prompt = prompt,
+                sample = sample,
+                style = style
             )
+        )
+
+        if (response.error != null) {
+            throw TranscribeException.ServerReturnedError(response.error)
         }
 
-        try {
-            return audioRecorder.stopRecording()
-        } catch (e: Exception) {
-            throw TranscribeException.EncodingFailed(
-                reason = "音频编码失败: ${e.message}",
-                cause = e
-            )
-        }
+        commitTextHandler.commitText(response.text)
+
+        return TranscribeResult(
+            text = response.text,
+            originalText = response.originalText,
+            serverDurationMs = response.durationMs?.toLong(),
+            totalDurationMs = System.currentTimeMillis() - startTime,
+            sessionId = sessionId
+        )
     }
 
     /**
