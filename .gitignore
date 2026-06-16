@@ -16,6 +16,7 @@ __pycache__/
 *.pyc
 *.pyo
 server/__pycache__/
-
-# Conda
-server/environment.yml
+.venv/
+venv/
+.env
+.pytest_cache/

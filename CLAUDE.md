@@ -10,11 +10,16 @@ Fcitx5 AI Voice-to-Text Core — 语音输入 → ASR 转文字 → AI 风格化
 
 ## Architecture
 
+分层设计，依赖单向（app → pipeline → asr/stylize → config/models）：
+
 ```
 用户 → [Client: Kotlin / Android] → HTTP/JSON → [Server: Python / FastAPI]
-                                                        ├── asr.py      (固定模拟 → 讯飞/Whisper)
-                                                        ├── stylize.py  (固定模拟 → LLM API)
-                                                        └── app.py      (FastAPI 路由入口)
+                                                  app.py      (路由层，只接线)
+                                                    └→ pipeline.py  (编排：校验→ASR→风格化→响应+错误处理)
+                                                         ├── asr.py      (ASRProvider 抽象 + Mock + 工厂)
+                                                         └── stylize.py  (Stylizer 抽象 + 规则实现 + 工厂)
+                                                  config.py   (读取 .env 配置)
+                                                  models.py   (Pydantic 模型 + Style 枚举)
 ```
 
 - **Client**: Kotlin（Android），对接 Fcitx5 输入法接口
@@ -25,16 +30,18 @@ Fcitx5 AI Voice-to-Text Core — 语音输入 → ASR 转文字 → AI 风格化
 
 | 模块 | 职责 |
 |---|---|
-| `app.py` | FastAPI 入口，/health GET + /v1/transcribe POST |
-| `models.py` | TranscribeRequest / TranscribeResponse Pydantic 模型 |
-| `asr.py` | 音频 → 文字（当前固定模拟） |
-| `stylize.py` | 文字 → 风格化（当前规则模拟，支持正式/精简/礼貌/翻译_英文/自定义） |
+| `app.py` | FastAPI 入口，/health GET + /v1/transcribe POST，仅路由与中间件 |
+| `pipeline.py` | 编排一次请求的完整流程，并把可预期错误转成响应 error 字段 |
+| `config.py` | 从 .env / 环境变量读取配置（provider、key、大小上限、CORS） |
+| `models.py` | TranscribeRequest / TranscribeResponse 模型 + Style 风格枚举 |
+| `asr.py` | 音频 → 文字：ASRProvider 抽象基类 + MockASRProvider + get_asr_provider 工厂 |
+| `stylize.py` | 文字 → 风格化：Stylizer 抽象基类 + RuleBasedStylizer + get_stylizer 工厂（正式/精简/礼貌/翻译_英文/自定义） |
 
 ## Commands
 
 ```bash
 # 激活环境
-conda activate v2t
+.\.venv\Scripts\Activate.ps1
 
 # 启动服务端（开发模式，带热重载）
 uvicorn server.app:app --reload --host 0.0.0.0 --port 8080
@@ -74,7 +81,12 @@ Response:
 
 ## Migration Path
 
-当前是原型阶段，后续接入真实 API 只需修改内部实现，**接口定义不变**：
+当前是原型阶段，后续接入真实 API **无需改动核心代码或接口定义**，只需三步：
 
-- `asr.py` → `transcribe()` 替换为讯飞 / Whisper / 阿里云 ASR 调用
-- `stylize.py` → `stylize()` 替换为 DeepSeek / 通义千问 / Claude LLM 调用
+1. 新增一个继承 `ASRProvider` / `Stylizer` 的类，实现其抽象方法；
+2. 在对应模块的 `_PROVIDERS` 字典里注册名称；
+3. 改 `.env` 的 `ASR_PROVIDER` / `LLM_PROVIDER` 为新名字，并填好 key。
+
+例如：
+- `asr.py` → 新增 `XunfeiASRProvider` / `WhisperASRProvider`
+- `stylize.py` → 新增 `DeepSeekStylizer` / `QwenStylizer` / `ClaudeStylizer`

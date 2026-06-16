@@ -15,7 +15,8 @@ import java.util.concurrent.TimeUnit
 /**
  * Retrofit 实现的 HTTP 客户端，对接服务端 /v1/transcribe。
  *
- * @param baseUrl 服务端基础 URL（默认 http://localhost:8080）
+ * @param baseUrl 服务端基础 URL（默认 http://10.0.2.2:8080）
+ * @param apiToken 可选的 API 鉴权 token，留空则不添加请求头
  */
 class RetrofitTranscribeService(
     /**
@@ -25,7 +26,8 @@ class RetrofitTranscribeService(
      * - 真机 + 局域网: http://192.168.x.x:8080
      * - 真机 + USB 反向代理: http://localhost:8080（需 adb reverse tcp:8080 tcp:8080）
      */
-    baseUrl: String = "http://10.0.2.2:8080"
+    baseUrl: String = "http://10.0.2.2:8080",
+    private val apiToken: String? = null
 ) : TranscribeService {
 
     private val api: TranscribeApi
@@ -39,6 +41,17 @@ class RetrofitTranscribeService(
             .connectTimeout(RetryPolicy.CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .readTimeout(RetryPolicy.READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .addInterceptor(logging)
+            .addInterceptor { chain ->
+                val originalRequest = chain.request()
+                val builder = originalRequest.newBuilder()
+
+                // 如果配置了 API token，添加到请求头
+                if (!apiToken.isNullOrEmpty()) {
+                    builder.header("X-API-Token", apiToken)
+                }
+
+                chain.proceed(builder.build())
+            }
             .build()
 
         val retrofit = Retrofit.Builder()

@@ -7,6 +7,8 @@ FastAPI 服务入口（路由层）。
 所有业务逻辑下沉到 pipeline.py，所有可调参数来自 config.py。
 """
 
+import logging
+import sys
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -16,6 +18,18 @@ from .models import TranscribeRequest, TranscribeResponse
 from .pipeline import run_transcribe
 
 settings = get_settings()
+
+# 配置日志
+logging.basicConfig(
+    level=logging.DEBUG if settings.app_env == "development" else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+logger.info(
+    f"[Server] 启动: env={settings.app_env}, asr_provider={settings.asr_provider}, "
+    f"llm_provider={settings.llm_provider}, api_token_enabled={'✓' if settings.api_token else '✗'}"
+)
 
 app = FastAPI(
     title="Fcitx5 AI Voice-to-Text Core",
@@ -49,8 +63,14 @@ def require_token(x_api_token: Optional[str] = Header(None)) -> None:
     settings.api_token 为空（默认）时直接放行，行为与原型一致；
     配置了 token 后，请求头 X-API-Token 不匹配则返回 401。
     """
-    if settings.api_token and x_api_token != settings.api_token:
-        raise HTTPException(status_code=401, detail="无效或缺失的 API token")
+    if settings.api_token:
+        if not x_api_token:
+            logger.warning("[Auth] 请求缺失 X-API-Token 请求头")
+            raise HTTPException(status_code=401, detail="缺失 API token")
+        if x_api_token != settings.api_token:
+            logger.warning(f"[Auth] 请求提供了错误的 API token")
+            raise HTTPException(status_code=401, detail="无效的 API token")
+        logger.debug("[Auth] API token 验证通过")
 
 
 @app.post("/v1/transcribe", response_model=TranscribeResponse)

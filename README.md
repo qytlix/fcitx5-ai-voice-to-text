@@ -35,15 +35,27 @@ fcitx5-ai-voice-to-text-core/
 ├── client/                  # Android 客户端（Kotlin 模块）
 │   └── (待开发)
 ├── server/                  # 服务端（Python / FastAPI）
-│   ├── app.py              # FastAPI 入口 / API 路由
-│   ├── asr.py              # ASR 转文字模块（当前固定模拟，后续接真实 API）
-│   ├── stylize.py          # 风格化模块（当前固定模拟，后续接 LLM API）
-│   ├── models.py           # Pydantic 数据模型
+│   ├── app.py              # FastAPI 入口 / 路由层（只接线，不含业务逻辑）
+│   ├── pipeline.py         # 编排层：校验 → ASR → 风格化 → 组装响应 + 错误处理
+│   ├── asr.py              # ASR 层：抽象基类 + Mock 实现 + 工厂（可插拔 provider）
+│   ├── stylize.py          # 风格化层：抽象基类 + 规则实现 + 工厂（可插拔 provider）
+│   ├── models.py           # Pydantic 数据模型 + Style 风格枚举
+│   ├── config.py           # 配置层：读取 .env / 环境变量
 │   └── environment.yml     # Conda 环境配置
-├── docs/
-│   └── protocol.md         # 通信协议说明
+├── .env.example            # 环境变量模板（复制为 .env 后填值）
 └── README.md
 ```
+
+### 分层设计与「可插拔 provider」
+
+各层职责单一，依赖方向单向（app → pipeline → asr/stylize → config/models）：
+
+- **config.py** — 所有可调参数（provider、API key、大小上限、CORS）收敛于此，从 `.env` 读取。
+- **asr.py / stylize.py** — 各自定义一个抽象基类和一个原型阶段的 mock 实现，由工厂函数按配置选择 provider。
+- **pipeline.py** — 把流程串成一条线，并把可预期错误转成响应里的 `error` 字段，而非 500。
+- **app.py** — 仅负责路由与中间件，逻辑全部下沉。
+
+> 接入真实 ASR / LLM 时：新增一个继承基类的 provider 类 → 在该模块的 `_PROVIDERS` 注册 → 改 `.env` 里的 `ASR_PROVIDER` / `LLM_PROVIDER`。**核心代码与接口定义都不用改。**
 
 ## 通信协议
 
@@ -60,6 +72,8 @@ fcitx5-ai-voice-to-text-core/
 
 ### 响应（Server → Client）
 
+成功：
+
 ```json
 {
   "text": "您有一个新的会议邀请，安排在下午三点……",
@@ -68,6 +82,19 @@ fcitx5-ai-voice-to-text-core/
   "error": null
 }
 ```
+
+可预期错误（如 base64 非法、音频超限）——HTTP 仍为 200，`error` 非空：
+
+```json
+{
+  "text": "",
+  "original_text": "",
+  "duration_ms": 0,
+  "error": "audio 字段不是合法的 base64 数据"
+}
+```
+
+> 字段校验类错误（如 `style` 取值非法）由 FastAPI 在进入逻辑前拦下，返回 **422**。
 
 ## 风格系统
 
@@ -81,24 +108,49 @@ fcitx5-ai-voice-to-text-core/
 
 ## Quick Start（原型阶段）
 
-### 1. 创建并激活 Conda 环境
+### 1. 创建并激活 Python 虚拟环境
+
+Windows PowerShell:
+
+```powershell
+cd C:\Users\17879\Desktop\claude\zqProject
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+如果 `py` 没有注册，但知道 Python 安装路径，也可以使用完整路径：
+
+```powershell
+& 'C:\Users\17879\AppData\Local\Programs\Python\Python313\python.exe' -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+Conda:
 
 ```bash
-cd server
-conda env create -f environment.yml
+conda env create -f server/environment.yml
 conda activate fcitx5-voice
 ```
 
-### 2. 启动服务端
+### 2. （可选）配置环境变量
 
 ```bash
-# 确保 conda 环境已激活 (fcitx5-voice)
+cp .env.example .env
+```
+
+原型阶段无需任何配置即可运行（默认全部走 mock）。需要接真实 API 或收紧 CORS 时再编辑 `.env`。
+
+### 3. 启动服务端
+
+```bash
 uvicorn server.app:app --reload --host 0.0.0.0 --port 8080
 ```
 
 > `--reload` 仅在开发阶段使用，修改代码后自动重启。
 
-### 3. 测试接口
+### 4. 测试接口
 
 ```bash
 # 健康检查

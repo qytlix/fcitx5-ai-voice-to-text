@@ -11,12 +11,17 @@ pipeline 调用方不变。
 """
 
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from openai import OpenAI
+
 from .config import Settings
 from .models import Style
+
+logger = logging.getLogger(__name__)
 
 
 class StylizeError(Exception):
@@ -125,13 +130,65 @@ class RuleBasedStylizer(Stylizer):
         return f"[{prompt or '自定义'}]: {text}"
 
 
+class DeepSeekStylizer(Stylizer):
+    """真实 LLM 风格化：调用 DeepSeek API（v4flash 模型）。"""
+
+    def __init__(self, api_key: str):
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com",
+        )
+
+    def stylize(self, text: str, style: Style, prompt: Optional[str] = None) -> str:
+        """使用 DeepSeek 进行风格化。"""
+        style_prompt = self._build_style_prompt(text, style, prompt)
+
+        try:
+            response = self.client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": style_prompt}],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            result = response.choices[0].message.content.strip()
+            logger.debug(f"[DeepSeek] 风格化完成: {result[:100]}")
+            return result
+        except Exception as e:
+            error_msg = f"DeepSeek API 调用失败: {str(e)}"
+            logger.error(f"[DeepSeek] {error_msg}")
+            raise StylizeError(error_msg)
+
+    def _build_style_prompt(self, text: str, style: Style, custom_prompt: Optional[str]) -> str:
+        """根据风格构造 prompt。"""
+        style_instructions = {
+            Style.FORMAL: "请将以下文本转换为正式书面语，移除口语表达和语气词，使用规范的词汇和表达方式。",
+            Style.CONCISE: "请精简以下文本，保留核心信息，移除冗余和修饰词。",
+            Style.POLITE: "请使用礼貌用语重新表述以下文本，加入敬语（如"您"），表现出尊重和礼貌。",
+            Style.TRANSLATE_EN: "请将以下中文文本翻译成英文，保留原意。",
+            Style.CUSTOM: f"请按照以下要求处理文本：{custom_prompt or '无特殊要求'}",
+        }
+
+        instruction = style_instructions.get(style, "请处理以下文本。")
+        return f"{instruction}\n\n文本：{text}"
+
+
 # provider 名称 → 构造函数。新增真实 LLM provider 时在此注册。
 _PROVIDERS = {
     "mock": RuleBasedStylizer,
+    "deepseek": DeepSeekStylizer,
 }
 
 
 def get_stylizer(settings: Settings) -> Stylizer:
-    """根据配置返回 Stylizer 实例。未知名称时回退到规则实现。"""
+    """根据配置返回 Stylizer 实例。"""
+    if settings.llm_provider == "deepseek":
+        if not settings.llm_api_key:
+            raise StylizeError(
+                "DeepSeek provider 已启用但 LLM_API_KEY 未配置。"
+                "请在 .env 中设置 LLM_API_KEY。"
+            )
+        return DeepSeekStylizer(api_key=settings.llm_api_key)
+
+    # 回退到 mock 或其他 provider
     provider_cls = _PROVIDERS.get(settings.llm_provider, RuleBasedStylizer)
     return provider_cls()
