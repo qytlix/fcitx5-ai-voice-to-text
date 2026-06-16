@@ -12,5 +12,6 @@ data class TranscribeResult(
     val text: String,
     val originalText: String,
     val serverDurationMs: Long? = null,
-    val totalDurationMs: Long = 0L
+    val totalDurationMs: Long = 0L,
+    val sessionId: String? = null
 )

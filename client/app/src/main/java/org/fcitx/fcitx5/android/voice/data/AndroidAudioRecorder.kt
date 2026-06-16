@@ -5,8 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
 import org.fcitx.fcitx5.android.voice.core.bridge.AudioRecorder
 import java.io.ByteArrayOutputStream
 import java.util.Base64
@@ -16,6 +15,8 @@ import java.util.Base64
  *
  * 采集 16kHz / 16-bit / 单声道 PCM 音频，输出为 WAV 格式的 base64 字符串。
  * 录音在后台线程执行，不阻塞主线程。
+ * [startRecording] 启动后在后台持续读取 PCM 数据，
+ * [stopRecording] 停止采集并返回累积的 base64 WAV。
  *
  * @param sampleRate   采样率（Hz），ASR 常用 16000
  * @param channelConfig 声道配置，默认单声道
@@ -48,13 +49,20 @@ class AndroidAudioRecorder(
     @Volatile
     private var _isRecording = false
 
+    /** 后台采集协程 */
+    private var recordingJob: Job? = null
+
+    /** PCM 数据累积缓存（线程安全） */
+    @Volatile
+    private var pcmOutputStream: ByteArrayOutputStream? = null
+
     override val isRecording: Boolean get() = _isRecording
 
     /**
      * 开始录音。
      *
-     * 在 IO 调度器上创建 AudioRecord 实例并开始采集。
-     * 录音数据写入内部 ByteArrayOutputStream。
+     * 创建 AudioRecord 实例，启动采集，并在后台协程中持续从
+     * AudioRecord 缓冲区读取 PCM 数据，写入内部 ByteArrayOutputStream。
      */
     override suspend fun startRecording() = withContext(Dispatchers.IO) {
         if (_isRecording) {
@@ -63,23 +71,61 @@ class AndroidAudioRecorder(
         }
 
         try {
-            val record = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
+            // 优先尝试 VOICE_RECOGNITION（模拟器兼容性更好），失败则回退到 MIC
+            val record = try {
+                val r = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    sampleRate, channelConfig, audioFormat, bufferSize
+                )
+                if (r.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.d(TAG, "使用 VOICE_RECOGNITION 音频源")
+                    r
+                } else {
+                    r.release()
+                    Log.w(TAG, "VOICE_RECOGNITION 不可用(state=${r.state})，回退到 MIC")
+                    AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        sampleRate, channelConfig, audioFormat, bufferSize
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "VOICE_RECOGNITION 失败，回退到 MIC: ${e.message}")
+                AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    sampleRate, channelConfig, audioFormat, bufferSize
+                )
+            }
 
             if (record.state != AudioRecord.STATE_INITIALIZED) {
                 throw RuntimeException("AudioRecord 初始化失败 (state=${record.state})")
             }
 
             audioRecord = record
+            pcmOutputStream = ByteArrayOutputStream()
             _isRecording = true
             record.startRecording()
 
             Log.d(TAG, "录音已启动: ${sampleRate}Hz, bufferSize=${bufferSize}")
+
+            // 在 IO 调度器上启动后台读循环
+            val recordRef = record
+            recordingJob = CoroutineScope(Dispatchers.IO).launch {
+                val buffer = ByteArray(bufferSize)
+                val output = pcmOutputStream ?: return@launch
+                Log.d(TAG, "录音后台读取循环已启动")
+                while (_isRecording) {
+                    val bytesRead = recordRef.read(buffer, 0, buffer.size)
+                    if (bytesRead > 0) {
+                        synchronized(output) {
+                            output.write(buffer, 0, bytesRead)
+                        }
+                    } else if (bytesRead < 0) {
+                        Log.w(TAG, "AudioRecord.read() 返回错误: $bytesRead")
+                        break
+                    }
+                }
+                Log.d(TAG, "录音后台读取循环已结束")
+            }
         } catch (e: SecurityException) {
             _isRecording = false
             throw RuntimeException("录音权限被拒绝", e)
@@ -93,49 +139,44 @@ class AndroidAudioRecorder(
      * 停止录音并返回 base64 编码的 WAV 音频数据。
      *
      * 流程：
-     * 1. 停止 AudioRecord 采集
-     * 2. 从 ByteArrayOutputStream 读取 PCM 数据
-     * 3. 添加 WAV 文件头
-     * 4. Base64 编码
+     * 1. 设置标志停止后台采集
+     * 2. 停止 AudioRecord
+     * 3. 从 ByteArrayOutputStream 读取全量 PCM 数据
+     * 4. 添加 WAV 文件头
+     * 5. Base64 编码
      *
      * @return base64 编码的 WAV 音频数据
      */
     override suspend fun stopRecording(): String = withContext(Dispatchers.IO) {
         val record = audioRecord ?: throw RuntimeException("没有正在进行的录音")
 
+        // 停止后台采集
         _isRecording = false
-        record.stop()
+        recordingJob?.cancel()
+        recordingJob = null
 
-        // 从 AudioRecord 读取 PCM 数据
-        val pcmData = readPcmData(record)
+        // 等待一小段时间确保后台循环已处理完最后的数据
+        delay(50)
+
+        try {
+            record.stop()
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "AudioRecord.stop() 已调用过或未启动: ${e.message}")
+        }
         record.release()
         audioRecord = null
 
-        Log.d(TAG, "录音已停止: ${pcmData.size} bytes PCM")
+        // 从累积缓存读取 PCM
+        val pcmData = pcmOutputStream?.let { out ->
+            synchronized(out) { out.toByteArray() }
+        } ?: ByteArray(0)
+        pcmOutputStream = null
+
+        Log.d(TAG, "录音已停止: ${pcmData.size} bytes PCM (${pcmData.size / 32}ms)")
 
         // 添加 WAV 头并编码为 base64
         val wavData = createWavFile(pcmData, sampleRate, audioFormat)
         Base64.getEncoder().encodeToString(wavData)
-    }
-
-    /**
-     * 从 AudioRecord 读取所有 PCM 数据。
-     */
-    private fun readPcmData(record: AudioRecord): ByteArray {
-        val buffer = ByteArray(bufferSize)
-        val outputStream = ByteArrayOutputStream()
-
-        while (_isRecording || record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-            val bytesRead = record.read(buffer, 0, buffer.size)
-            if (bytesRead > 0) {
-                outputStream.write(buffer, 0, bytesRead)
-            } else if (bytesRead < 0) {
-                Log.w(TAG, "AudioRecord.read() 返回错误: $bytesRead")
-                break
-            }
-        }
-
-        return outputStream.toByteArray()
     }
 
     /**

@@ -30,12 +30,20 @@ Fcitx5 AI Voice-to-Text Core — 语音输入 → ASR 转文字 → AI 风格化
 
 | 模块 | 职责 |
 |---|---|
-| `app.py` | FastAPI 入口，/health GET + /v1/transcribe POST，仅路由与中间件 |
+| `app.py` | FastAPI 入口，/health GET + /v1/transcribe POST + /v1/feedback POST + /v1/feedback/count GET，仅路由与中间件 |
 | `pipeline.py` | 编排一次请求的完整流程，并把可预期错误转成响应 error 字段 |
 | `config.py` | 从 .env / 环境变量读取配置（provider、key、大小上限、CORS） |
-| `models.py` | TranscribeRequest / TranscribeResponse 模型 + Style 风格枚举 |
+| `models.py` | TranscribeRequest / TranscribeResponse / FeedbackRequest / FeedbackResponse Pydantic 模型 + Style 风格枚举 |
 | `asr.py` | 音频 → 文字：ASRProvider 抽象基类 + MockASRProvider + get_asr_provider 工厂 |
 | `stylize.py` | 文字 → 风格化：Stylizer 抽象基类 + RuleBasedStylizer + get_stylizer 工厂（正式/精简/礼貌/翻译_英文/自定义） |
+| `feedback_store.py` | JSONL 文件存储（server/data/feedback.jsonl，append / list / rotate） |
+
+## Environment
+
+- **Android SDK**: `~/Android/Sdk` (Windows: `%APPDATA%/Local/Android/Sdk`)
+- **Java**: Java 17 LTS (Adoptium/Eclipse Temurin)
+- **Python**: 3.8+, recommend using venv
+- **Project Path**: Current working directory
 
 ## Commands
 
@@ -46,6 +54,20 @@ Fcitx5 AI Voice-to-Text Core — 语音输入 → ASR 转文字 → AI 风格化
 # 启动服务端（开发模式，带热重载）
 uvicorn server.app:app --reload --host 0.0.0.0 --port 8080
 
+# 构建 Android APK
+cd client
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:assembleDebug
+
+# 运行单元测试
+cd client
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :core:test
+
+# 安装 APK 到设备
+adb install client/app/build/outputs/apk/debug/app-debug.apk
+
+# USB 反向代理（真机测试用）
+adb reverse tcp:8080 tcp:8080
+
 # 测试健康检查
 curl http://localhost:8080/health
 
@@ -53,7 +75,16 @@ curl http://localhost:8080/health
 curl -X POST http://localhost:8080/v1/transcribe \
   -H "Content-Type: application/json" \
   -d '{"audio": "AAECAw==", "style": "正式"}'
+
+# 测试反馈接口
+curl -X POST http://localhost:8080/v1/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"original_text":"test","styled_text":"test","final_text":"edited","style":"正式","duration_ms":100}'
+
+# 查看反馈计数
+curl http://localhost:8080/v1/feedback/count
 ```
+
 
 ## API 接口
 

@@ -16,6 +16,7 @@ android {
     }
 
     buildFeatures {
+        aidl = true
         viewBinding = true
     }
 

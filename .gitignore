@@ -20,3 +20,9 @@ server/__pycache__/
 venv/
 .env
 .pytest_cache/
+
+# Conda
+server/environment.yml
+
+# Git worktrees (temp server checkout)
+server_temp/

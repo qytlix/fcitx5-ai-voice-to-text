@@ -13,7 +13,10 @@
 ### 1.2 运行环境
 
 - **宿主**: Fcitx5 Android (`org.fcitx.fcitx5.android`)
-- **集成方式**: 独立 APK 插件，通过 Fcitx5 Plugin System（AIDL IPC）与主应用通信
+- **集成方式**: 独立 APK 插件，通过 AIDL IPC 与 Fcitx5 主应用通信
+  - 插件 Action: `org.fcitx.fcitx5.android.plugin.SERVICE`
+  - 插件包名: `org.fcitx.fcitx5.android.voice`（暂定）
+  - 主应用通过 `bindService()` 绑定插件，注册 `IVoiceInputCallback` 接收结果
 - **最低 SDK**: Android 8.0 (API 26)
 
 ### 1.3 设计原则
@@ -22,8 +25,8 @@
 |------|------|
 | **松耦合** | 录音、网络、上屏三模块通过接口隔离，可独立替换 |
 | **可测试** | 核心逻辑通过接口抽象，可提供 Mock 实现进行单元测试 |
-| **渐进增强** | 原型阶段支持手动启动录音 + 纯 UI 展示，后续再优化自动化流程 |
-| **Fcitx5 原生集成** | 复用 Fcitx5 Android 现有架构，不做重复轮子 |
+| **Fcitx5 原生集成** | 复用 Fcitx5 Android 插件机制，不做重复轮子 |
+| **反馈闭环** | 利用 IME 级 InputConnection 采集用户后续编辑，持续优化风格化效果 |
 
 ---
 
@@ -54,7 +57,7 @@ client/
 
 ### 3.1 `bridge` — Fcitx5 集成桥接层
 
-负责与 Fcitx5 Android 主应用的 IPC 通信和文字上屏。
+负责与 Fcitx5 Android 主应用的 IPC 通信。
 
 ```kotlin
 package org.fcitx.fcitx5.android.voice.bridge
@@ -67,58 +70,53 @@ package org.fcitx.fcitx5.android.voice.bridge
 interface CommitTextHandler {
     /** 提交最终文本到当前输入框 */
     fun commitText(text: String)
-    
-    /** 设置正在拼写中的文本（可选，用于实时预览） */
-    fun setComposingText(text: String)
-    
-    /** 清除正在拼写中的文本 */
-    fun clearComposingText()
 }
 
 /**
- * Fcitx5 Android 插件服务，实现主应用定义的插件 AIDL 接口。
+ * Fcitx5 Android 语音输入插件服务。
  *
- * 当 Fcitx5 Android 加载此插件时，会通过 bindService 启动此服务。
- * 服务内部通过 FcitxInputMethodService 已提供的 InputConnection
- * 机制完成文字提交（但作为插件，我们通过 AIDL IPC 调用 FcitxRemoteService）。
- *
- * 参见: FcitxPluginServices.PLUGIN_SERVICE_ACTION
+ * 作为 AIDL-bound Service 被 Fcitx5 主应用发现和绑定。
+ * 在独立进程 `:fcitx_plugin_voice` 中运行。
  */
 class VoiceInputPluginService : Service() {
-    // 实现 IFcitxRemoteService (类比 clipboard-filter 插件模式)
-    // 注册为 Fcitx5 的语音输入插件
-    
+
     private val binder = object : IVoiceInputPlugin.Stub() {
-        // AIDL 定义的方法
+        override fun startRecording() { /* ... */ }
+        override fun stopRecording() { /* ... */ }
+        override fun cancelRecording() { /* ... */ }
+        override fun setStyle(style: String) { /* ... */ }
+        override fun registerCallback(callback: IVoiceInputCallback?) { /* ... */ }
+        override fun isRecording(): Boolean { /* ... */ }
+        override fun getVersion(): String { /* ... */ }
     }
 }
+```
 
-/**
- * Fcitx5 插件 AIDL 接口定义。
- * 
- * 主应用通过此接口与语音插件通信，触发录音开始/停止、接收状态回调。
- */
+AIDL 接口定义：
+
+```aidl
 // IVoiceInputPlugin.aidl
 interface IVoiceInputPlugin {
-    /** 启动语音输入 */
-    void startVoiceInput();
-    /** 取消当前语音输入 */
-    void cancelVoiceInput();
-    /** 注册回调，主应用接收状态更新 */
-    void registerCallback(IVoiceInputCallback callback);
+    void startRecording();              // 开始录音
+    void stopRecording();               // 停止录音 → 转录 → 回调
+    void cancelRecording();             // 取消（丢弃音频）
+    void setStyle(String style);        // 设置风格
+    void registerCallback(IVoiceInputCallback callback);  // 注册回调
+    boolean isRecording();              // 查询状态
+    String getVersion();                // 获取版本
 }
+```
 
-/**
- * 回调接口，插件 → 主应用。
- */
+```aidl
 // IVoiceInputCallback.aidl
 interface IVoiceInputCallback {
-    /** 语音输入状态变化 */
-    void onStateChanged(int state, String message);
-    /** 结果准备就绪 */
-    void onResult(String text);
-    /** 发生错误 */
-    void onError(int code, String message);
+    void onResult(String text, String originalText, long durationMs);
+    void onError(String message);
+    void onStateChanged(int state);     // STATE_IDLE=0 / STATE_RECORDING=1 / STATE_PROCESSING=2
+
+    const int STATE_IDLE = 0;
+    const int STATE_RECORDING = 1;
+    const int STATE_PROCESSING = 2;
 }
 ```
 
@@ -207,15 +205,26 @@ class TranscribeUseCase(
     private val transcribeService: TranscribeService,
     private val commitTextHandler: CommitTextHandler
 ) {
+    /** 开始录音（两段式第一段） */
+    suspend fun startRecording()
+
+    /** 停止录音并转录（两段式第二段） */
+    suspend fun stopRecordingAndTranscribe(
+        style: String = "正式",
+        prompt: String? = null,
+        sample: String? = null
+    ): TranscribeResult
+
     /**
-     * 执行一次完整的语音输入流程。
-     * 返回 TranscribeResult 以支持 UI 状态跟踪。
+     * 一站式执行：录音 → 发送 → 上屏。
+     * 也可通过 audioSource 直接传入 base64 音频跳过录音。
      */
     suspend fun execute(
         style: String = "正式",
         prompt: String? = null,
-        audioSource: String? = null // 可选: 传入 base64 音频（跳过录音）
-    ): Result<TranscribeResult>
+        sample: String? = null,
+        audioSource: String? = null
+    ): TranscribeResult
 }
 
 /**
@@ -373,83 +382,109 @@ class VoiceInputViewModel(
 ### 5.1 集成层级
 
 ```
-┌─────────────────────────────────────────────────┐
-│  System UI (键盘/候选词/剪贴板)                   │
-│  FcitxInputMethodService                        │
-│  ├─ commitText()  ← 最终文字从这里上屏            │
-│  ├─ setComposingText()  ← 实时预览文本            │
-│  └─ InputConnection (Android 系统 API)            │
-├─────────────────────────────────────────────────┤
-│  Fcitx5 Core (native C++ 引擎)                   │
-├─────────────────────────────────────────────────┤
-│  FcitxPluginServices (AIDL IPC)                  │
-│  ├─ clipboard-filter 插件                        │
-│  └─ voice-input 插件 (本项目) ← NEW              │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  目标应用编辑框 (EditText / WebView / 富文本)          │
+│  ↑ Android InputConnection                            │
+├─────────────────────────────────────────────────────┤
+│  Fcitx5 Android 主应用                                │
+│  ├─ FcitxInputMethodService                         │
+│  │  ├─ 键盘 UI（语音按钮）                            │
+│  │  ├─ VoiceInputManager（bind / callback）          │
+│  │  └─ InputConnection.commitText()                 │
+│  └─ VoiceFeedbackCollector（采集用户修改）             │
+├─────────────────────────────────────────────────────┤
+│  AIDL IPC（跨进程）                                    │
+│  ├─ IVoiceInputPlugin  ← 主应用调用插件               │
+│  └─ IVoiceInputCallback ← 插件回调结果                │
+├─────────────────────────────────────────────────────┤
+│  语音输入插件 APK（本仓库 client/app）                 │
+│  ├─ VoiceInputPluginService                         │
+│  ├─ AndroidAudioRecorder                            │
+│  ├─ RetrofitTranscribeService                       │
+│  └─ TranscribeUseCase                               │
+└─────────────────────────────────────────────────────┘
 ```
 
-### 5.2 集成方式：作为 Fcitx5 Android 插件
+### 5.2 集成方式：Fcitx5 Android 插件（已选定）
 
-参照 clipboard-filter 插件模式，我们的客户端作为独立的 Android APK：
+本项目作为独立 APK 插件运行，通过 AIDL 与 Fcitx5 Android 主应用双向通信：
 
-1. **插件 APK** 使用 `FcitxPluginServices.PLUGIN_SERVICE_ACTION` 注册
-2. **主应用**启动时自动发现并绑定已安装的插件
-3. 插件通过 AIDL 定义的 `IVoiceInputPlugin` 接口提供服务
-4. 主应用中的 `FcitxInputMethodService` 在键盘上添加"语音按钮"，点击后通过 AIDL 调用插件
+1. **插件 APK** 在 `AndroidManifest.xml` 中声明 `VoiceInputPluginService`，并注册 `org.fcitx.fcitx5.android.plugin.SERVICE` action
+2. **主应用**通过 `bindService()` 显式绑定插件（包名 + action）
+3. 主应用调用 `IVoiceInputPlugin.startRecording()` / `stopRecording()` 控制录音
+4. 插件完成录音、编码、HTTP 请求后，通过 `IVoiceInputCallback.onResult()` 回调结果
+5. 主应用在回调中调用 `InputConnection.commitText()` 完成上屏
 
-Plugin manifest 配置（`AndroidManifest.xml`）：
+Manifest 配置（已在本仓库实现）：
 ```xml
 <service
     android:name=".bridge.VoiceInputPluginService"
     android:exported="true"
-    android:process=":plugin">
+    android:process=":fcitx_plugin_voice"
+    android:description="@string/plugin_description">
     <intent-filter>
         <action android:name="org.fcitx.fcitx5.android.plugin.SERVICE" />
     </intent-filter>
 </service>
 ```
 
-### 5.3 集成方式备选：独立应用 + AIDL IPC
+### 5.3 插件交互时序图
 
-若 Fcitx5 Android 插件机制尚未完备，备选方案为独立 Android 应用：
-- 通过 `IFcitxRemoteService` 与 Fcitx5 主应用通信
-- 利用 Android `InputMethodManager` 直接提交文字
-- 作为 Accessibility Service 写入文字（降级方案）
+```mermaid
+sequenceDiagram
+    actor U as 用户
+    participant F as Fcitx5 主应用
+    participant AIDL as AIDL IPC
+    participant SVC as VoiceInputPluginService
+    participant REC as AndroidAudioRecorder
+    participant NET as RetrofitTranscribeService
+    participant SRV as Server
 
-### 5.4 `CommitTextHandler` 实现
+    U->>F: 按住语音按钮 (ACTION_DOWN)
+    F->>AIDL: startRecording()
+    AIDL->>SVC: startRecording()
+    SVC->>REC: startRecording()
+    REC-->>SVC: recording...
+    SVC-->>AIDL: onStateChanged(STATE_RECORDING)
+    AIDL-->>F: 显示录音中 UI
 
-```kotlin
-/**
- * Fcitx5 Android 集成实现。
- * 
- * 作为插件运行时，通过 FcitxPluginServices 发送消息实现文字提交。
- * 作为独立应用时，通过 InputConnection / Clipboard 实现文字提交。
- */
-class Fcitx5CommitTextHandler(
-    private val context: Context
-) : CommitTextHandler {
-    
-    override fun commitText(text: String) {
-        // 方式一：通过 InputMethodService 的 InputConnection（插件内部使用）
-        // 方式二：通过剪贴板 + FcitxRemoteService（跨进程使用）
-        // 方式三：通过 AccessibilityService（降级方案）
-        
-        // 这里采用方案二：利用 Fcitx5 的剪贴板机制
-        val intent = Intent()
-        intent.action = FcitxPluginServices.PLUGIN_SERVICE_ACTION
-        intent.setPackage("org.fcitx.fcitx5.android")
-        context.sendBroadcast(intent)
-    }
-    
-    override fun setComposingText(text: String) {
-        // 通过 InputConnection.setComposingText() 实现实时预览
-    }
-    
-    override fun clearComposingText() {
-        // 清除预览文本
-    }
-}
+    U->>F: 释放按钮 (ACTION_UP)
+    F->>AIDL: stopRecording()
+    AIDL->>SVC: stopRecording()
+    SVC->>REC: stopRecording()
+    REC-->>SVC: base64 WAV
+    SVC-->>AIDL: onStateChanged(STATE_PROCESSING)
+    AIDL-->>F: 显示处理中 UI
+    SVC->>NET: POST /v1/transcribe
+    NET->>SRV: audio + style
+    SRV-->>NET: TranscribeResponse
+    NET-->>SVC: text, originalText
+    SVC->>AIDL: onResult(text, originalText, durationMs)
+    AIDL->>F: commitText(text, 1)
+    F->>F: VoiceFeedbackCollector 记录 styledText
+    SVC-->>AIDL: onStateChanged(STATE_IDLE)
+    AIDL-->>F: 恢复按钮状态
 ```
+
+### 5.4 主应用需要新增/修改的模块
+
+| 模块 | 职责 | 关键文件/类 |
+|---|---|---|
+| AIDL 集成 | 拷贝 AIDL 文件并启用 aidl build feature | `IVoiceInputPlugin.aidl`, `IVoiceInputCallback.aidl` |
+| 语音按钮 | 在键盘 UI 提供触发入口 | `KeyboardView` / Toolbar 布局 XML |
+| 插件连接管理 | bindService / 生命周期 / 异常恢复 | `VoiceInputManager` |
+| 回调实现 | 接收结果并上屏 | `IVoiceInputCallback.Stub` |
+| 反馈采集 | 读取输入框最终文本，计算与上屏文本差异 | `VoiceFeedbackCollector` |
+
+### 5.5 备选方案说明
+
+已排除以下方案：
+
+| 方案 | 排除原因 |
+|---|---|
+| AnySoftKeyboard | 使用系统 `RecognizerIntent`，无法获取 InputConnection 与后续修改 |
+| 独立 App + 剪贴板 | 体验割裂，需要用户手动粘贴 |
+| AccessibilityService | 需要额外权限，无法替代 IME 上屏体验 |
 
 ---
 
@@ -711,3 +746,103 @@ data class TranscribeResponse(
     val error: String? = null       // 错误信息
 )
 ```
+
+---
+
+## 13. 用户修改反馈闭环
+
+为了持续优化 AI 风格化效果，主应用需要采集“上屏后用户又修改了什么”。这一闭环只有在 IME 层级才能实现，也是选择 Fcitx5 插件路径（A 路径）而非独立 App / AnySoftKeyboard 的核心原因。
+
+### 13.1 反馈数据模型
+
+```kotlin
+data class VoiceFeedbackEvent(
+    val id: String,                   // 本次语音输入会话 ID
+    val originalText: String,         // ASR 原始转写
+    val styledText: String,           // AI 风格化后上屏的文本
+    val finalText: String,            // 用户最终确认的文本
+    val style: String,                // 使用的风格
+    val prompt: String?,              // 自定义提示词
+    val durationMs: Long,             // 处理耗时
+    val timestamp: Long               // 事件发生时间
+)
+```
+
+### 13.2 采集流程
+
+```mermaid
+sequenceDiagram
+    participant F as Fcitx5 主应用
+    participant IC as InputConnection
+    participant DB as 本地反馈数据库
+    participant SRV as Server
+
+    F->>IC: commitText(styledText, 1)
+    F->>DB: 暂存 (originalText, styledText, style, prompt, timestamp)
+
+    Note over F,IC: 用户在目标应用中继续编辑
+
+    F->>IC: getTextBeforeCursor(n, 0)
+    IC-->>F: finalText
+    F->>F: 计算 diff(styledText, finalText)
+    F->>DB: 更新 finalText 与 diff
+    F->>SRV: POST /v1/feedback (批量或实时)
+```
+
+### 13.3 触发采集的时机
+
+| 时机 | 说明 | 优缺点 |
+|---|---|---|
+| 输入框失去焦点 | `onFinishInput()` 时读取 | 简单，但可能错过同会话内的多次修改 |
+| 下次获得焦点 | `onStartInput()` 时读取上次内容 | 能获取到最终文本，延迟较长 |
+| 用户再次点击语音按钮 | 再次录音前读取 | 最贴近使用场景，推荐 |
+| 定时轮询 | 每 N 秒读取一次 | 实时性好，但耗电且复杂 |
+
+**推荐组合**：用户再次点击语音按钮时读取 + `onFinishInput()` 作为兜底。
+
+### 13.4 差异计算
+
+使用 Myer 差分算法或 Android `DiffUtil` 计算 `styledText` 到 `finalText` 的最小变更集：
+
+```kotlin
+val diff = DiffUtil.calculateDiff(
+    TextDiffCallback(styledText, finalText)
+)
+// 输出：插入、删除、替换的位置与内容
+```
+
+仅当差异比例超过阈值（如 10%）时才视为有效反馈，避免记录无意义的标点调整。
+
+### 13.5 服务端接口（后续实现）
+
+```http
+POST /v1/feedback
+Content-Type: application/json
+
+{
+  "original_text": "那个 下午三点 有个会",
+  "styled_text": "下午三点有个会。",
+  "final_text": "您有一个新的会议邀请，安排在下午三点。",
+  "style": "正式",
+  "prompt": null,
+  "duration_ms": 1240,
+  "timestamp": 1718500000000
+}
+```
+
+服务端将反馈数据存入数据集，用于：
+
+1. 优化各风格对应的 system prompt
+2. 筛选 badcase 进行人工标注
+3. 未来微调小模型或训练 LoRA
+
+### 13.6 主应用新增模块
+
+| 类/模块 | 职责 |
+|---|---|
+| `VoiceFeedbackCollector` | 在合适时机读取输入框内容，计算与上屏文本的差异 |
+| `FeedbackRepository` | 本地缓存反馈事件，支持批量上传与导出 |
+| `FeedbackUploader` | 调用 `POST /v1/feedback` |
+| `TextDiffCallback` | 封装 `DiffUtil` 计算文本差异 |
+
+---
