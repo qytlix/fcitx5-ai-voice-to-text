@@ -68,7 +68,10 @@ fcitx5-ai-voice-to-text-core/
 │   ├── requirements.txt     # Python 依赖
 │   └── environment.yml      # Conda 环境配置
 ├── .env.example             # 环境变量模板（复制为 .env 后填值）
-├── BUILD_GUIDE.md           # 详细的构建指南
+├── Dockerfile               # Docker 镜像定义
+├── docker-compose.yml       # Docker Compose 编排
+├── API.md                   # 服务端 API 文档
+├── DOCKER.md                # Docker 部署指南
 ├── CLAUDE.md                # 开发指南
 └── README.md                # 本文件
 ```
@@ -133,62 +136,45 @@ fcitx5-ai-voice-to-text-core/
 | `翻译_英文` | 翻译为英文并优化表达 |
 | `自定义` | 用户通过 `prompt` 参数自由定义 |
 
-## Quick Start（原型阶段）
+## 快速开始
 
-### 1. 创建并激活 Python 虚拟环境
-
-Windows PowerShell:
-
-```powershell
-cd C:\Users\17879\Desktop\claude\zqProject
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-如果 `py` 没有注册，但知道 Python 安装路径，也可以使用完整路径：
-
-```powershell
-& 'C:\Users\17879\AppData\Local\Programs\Python\Python313\python.exe' -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-Conda:
+### Docker 部署（推荐）
 
 ```bash
-conda env create -f server/environment.yml
-conda activate fcitx5-voice
-```
+# 1. 克隆项目
+git clone https://github.com/your-username/zqProject.git
+cd zqProject
 
-### 2. （可选）配置环境变量
-
-```bash
+# 2. 配置环境变量
 cp .env.example .env
+# 编辑 .env 填入讯飞凭证
+
+# 3. 启动服务
+docker-compose up -d
+
+# 4. 验证服务
+curl http://localhost:8080/health
 ```
 
-原型阶段无需任何配置即可运行（默认全部走 mock）。需要接真实 API 或收紧 CORS 时再编辑 `.env`。
+详见 [DOCKER.md](DOCKER.md) 和 [API.md](API.md)。
 
-### 3. 启动服务端
+### 本地开发
 
 ```bash
-# 确保虚拟环境已激活
-uvicorn server.app:app --reload --host 0.0.0.0 --port 8080
+# 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+.venv\Scripts\activate      # Windows
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 配置环境变量
+cp .env.example .env
+PYTHONIOENCODING=utf-8 uvicorn server.app:app --reload --port 8080
 ```
 
-> `--reload` 仅在开发阶段使用，修改代码后自动重启。
-
-### 4. 构建并安装插件 APK
-
-```bash
-cd client
-./gradlew :app:assembleDebug
-adb install app/build/outputs/apk/debug/app-debug.apk
-```
-
-详细构建指南参考 [BUILD_GUIDE.md](BUILD_GUIDE.md)。
-
-### 5. 测试接口
+### 测试接口
 
 ```bash
 # 健康检查
@@ -197,10 +183,17 @@ curl http://localhost:8080/health
 # 转录测试
 curl -X POST http://localhost:8080/v1/transcribe \
   -H "Content-Type: application/json" \
-  -d '{"audio": "AAECAw==", "style": "精简"}'
+  -d '{"audio": "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAAB9AAACABAAZGF0YQIAAAAAAA==", "style": "正式"}'
+```
 
-# 返回示例：
-# {"text":"[录音时长: 0ms] 好的。","original_text":"好的","duration_ms":0,"error":null}
+更多示例见 [API.md](API.md)。
+
+### 构建 Android 客户端
+
+```bash
+cd client
+./gradlew :app:assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## 后续规划（Roadmap）

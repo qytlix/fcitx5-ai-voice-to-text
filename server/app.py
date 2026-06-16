@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info(
     f"[Server] 启动: env={settings.app_env}, asr_provider={settings.asr_provider}, "
-    f"llm_provider={settings.llm_provider}, api_token_enabled={'✓' if settings.api_token else '✗'}"
+    f"llm_provider={settings.llm_provider}, api_token_enabled={'yes' if settings.api_token else 'no'}"
 )
 
 app = FastAPI(

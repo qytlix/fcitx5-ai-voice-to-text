@@ -34,7 +34,9 @@ class Settings(BaseSettings):
     # 接入真实 API 时，只需把这里改成新 provider 名 + 填好对应 key。
     asr_provider: str = "mock"            # mock | xunfei | whisper | ...
     llm_provider: str = "mock"            # mock | deepseek | qwen | claude | ...
-    asr_api_key: str = ""
+    asr_api_key: str = ""                 # 讯飞: APP_ID
+    asr_api_secret: str = ""              # 讯飞: API_KEY
+    asr_api_password: str = ""            # 讯飞: API_SECRET
     llm_api_key: str = ""
 
     # ---- 接口鉴权 ----
