@@ -1,133 +1,137 @@
 """
-固定风格化模块（原型阶段）
+风格化层：文字 → 风格化文字。
 
-不调用外部 LLM API，直接用规则做简单的风格转换。
-后续替换为真实 LLM 调用。
+与 asr.py 同构的「可插拔 provider」设计：
+    - Stylizer 是抽象基类，定义统一接口 stylize()。
+    - RuleBasedStylizer 是原型阶段的规则实现（不调用 LLM）。
+    - get_stylizer() 是工厂，根据配置里的 llm_provider 返回实例。
+
+接入真实 LLM（DeepSeek / 通义千问 / Claude）时，新增一个继承 Stylizer 的类即可，
+pipeline 调用方不变。
 """
 
+import json
 import re
+from abc import ABC, abstractmethod
 from typing import Optional
 
+from .config import Settings
+from .models import Style
 
-# 语气词集合
-FILLER_WORDS = {"嗯", "那个", "这个", "就是", "然后", "其实", "反正", "那个那个"}
+
+class StylizeError(Exception):
+    """风格化过程中的可预期错误。由 pipeline 捕获转成响应里的 error。"""
 
 
-def stylize(text: str, style: str = "正式", prompt: Optional[str] = None) -> str:
-    """
-    对 ASR 转写文本进行风格化处理。
-
-    当前为固定实现，使用规则做简单转换。
-    后续实现：调用 LLM API 进行真实风格化。
-    """
-    if style == "正式":
-        return _to_formal(text)
-    elif style == "精简":
-        return _to_concise(text)
-    elif style == "礼貌":
-        return _to_polite(text)
-    elif style == "翻译_英文":
-        return _to_english(text)
-    elif style == "自定义":
-        return _custom_style(text, prompt)
-    else:
-        return text
+# 口语语气词 / 冗余连接词，正式与精简风格都会去除。
+FILLER_WORDS = ("那个那个", "那个", "这个", "就是", "然后", "其实", "反正", "嗯")
 
 
 def _remove_fillers(text: str) -> str:
-    """去除语气词和冗余连接词"""
+    """去除语气词，并归并多余空格与重复标点。"""
     for word in FILLER_WORDS:
         text = text.replace(word, "")
-    # 去除多余空格和重复标点
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"[，,]+", "，", text)
     text = re.sub(r"[。.]+", "。", text)
+    # 去词后句首可能残留省略号或标点（如 "嗯…关于…" → "…关于…"），一并清掉。
+    text = text.lstrip("…．。.，,、　 ")
     return text
 
 
-def _to_formal(text: str) -> str:
-    """口语 → 正式书面语"""
-    text = _remove_fillers(text)
-
-    # 简单规则替换
-    replacements = {
-        "觉得": "认为",
-        "可以": "可以",
-        "改一下": "进行调整",
-        "搞一下": "进行处理",
-        "弄一下": "进行处理",
-        "看一下": "进行审查",
-        "那个": "",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    # 补全标点
+def _ensure_end_punct(text: str, tail: str = "。") -> str:
+    """若结尾没有句末标点，补上 tail。"""
     if text and not text.endswith(("。", "！", "？")):
-        text += "。"
-
+        text += tail
     return text
 
 
-def _to_concise(text: str) -> str:
-    """精简：去冗余，保留核心"""
-    text = _remove_fillers(text)
+class Stylizer(ABC):
+    """风格化提供方的统一接口。"""
 
-    # 去掉修饰性词语
-    text = re.sub(r"我觉得|我认为|我个人觉得|在我看来", "", text)
-    text = re.sub(r"其实|反正|怎么说呢|就是说|可以说是", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    if text and not text.endswith(("。", "！", "？")):
-        text += "。"
-
-    return text
+    @abstractmethod
+    def stylize(self, text: str, style: Style, prompt: Optional[str] = None) -> str:
+        """按指定风格处理文本。失败时抛 StylizeError。"""
+        raise NotImplementedError
 
 
-def _to_polite(text: str) -> str:
-    """礼貌：添加敬语"""
-    text = _remove_fillers(text)
+class RuleBasedStylizer(Stylizer):
+    """原型阶段的规则实现：不调用 LLM，用字符串规则做风格转换。"""
 
-    if text.startswith("你"):
-        text = "您" + text[1:]
-    text = text.replace("你", "您")
-    text = text.replace("帮我", "麻烦您帮我")
-    text = text.replace("我要", "我想")
+    def stylize(self, text: str, style: Style, prompt: Optional[str] = None) -> str:
+        if style is Style.FORMAL:
+            return self._to_formal(text)
+        if style is Style.CONCISE:
+            return self._to_concise(text)
+        if style is Style.POLITE:
+            return self._to_polite(text)
+        if style is Style.TRANSLATE_EN:
+            return self._to_english(text)
+        if style is Style.CUSTOM:
+            return self._custom(text, prompt)
+        return text  # 理论上不会到这（枚举已校验），兜底原样返回
 
-    if not text.startswith(("请", "麻烦", "您好")):
-        text = f"您好，{text}"
+    def _to_formal(self, text: str) -> str:
+        """口语 → 正式书面语。"""
+        text = _remove_fillers(text)
+        replacements = {
+            "觉得": "认为",
+            "改一下": "进行调整",
+            "搞一下": "进行处理",
+            "弄一下": "进行处理",
+            "看一下": "进行审查",
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return _ensure_end_punct(text)
 
-    if text and not text.endswith(("。", "！", "？")):
-        text += "。谢谢！"
+    def _to_concise(self, text: str) -> str:
+        """精简：去修饰、保留核心。"""
+        text = _remove_fillers(text)
+        text = re.sub(r"我觉得|我认为|我个人觉得|在我看来", "", text)
+        text = re.sub(r"其实|反正|怎么说呢|就是说|可以说是", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return _ensure_end_punct(text)
 
-    return text
+    def _to_polite(self, text: str) -> str:
+        """礼貌：加敬语。"""
+        text = _remove_fillers(text)
+        text = text.replace("你", "您")
+        text = text.replace("帮我", "麻烦您帮我")
+        text = text.replace("我要", "我想")
+        if not text.startswith(("请", "麻烦", "您好")):
+            text = f"您好，{text}"
+        return _ensure_end_punct(text, tail="。谢谢！")
+
+    def _to_english(self, text: str) -> str:
+        """模拟翻译为英文（原型用固定映射）。"""
+        mock_translations = {
+            "好的": "Okay.",
+            "下午三点有个会议": "There is a meeting at 3 PM.",
+            "我觉得这个方案还可以": "I think this plan is acceptable.",
+        }
+        for zh, en in mock_translations.items():
+            if zh in text:
+                return en
+        return f"[English translation]: {text}"
+
+    def _custom(self, text: str, prompt: Optional[str]) -> str:
+        """自定义：按 prompt 关键字做简单处理。"""
+        text = _remove_fillers(text)
+        if prompt and "json" in prompt.lower():
+            return json.dumps({"text": text, "note": "custom styled"}, ensure_ascii=False)
+        if prompt and "大写" in prompt:
+            return text.upper()
+        return f"[{prompt or '自定义'}]: {text}"
 
 
-def _to_english(text: str) -> str:
-    """模拟翻译为英文"""
-    # 固定映射（原型用）
-    mock_translations = {
-        "好的": "Okay.",
-        "下午三点有个会议": "There is a meeting at 3 PM.",
-        "我觉得这个方案还可以": "I think this plan is acceptable.",
-    }
-
-    for zh, en in mock_translations.items():
-        if zh in text:
-            return en
-
-    return f"[English translation]: {text}"
+# provider 名称 → 构造函数。新增真实 LLM provider 时在此注册。
+_PROVIDERS = {
+    "mock": RuleBasedStylizer,
+}
 
 
-def _custom_style(text: str, prompt: Optional[str]) -> str:
-    """自定义风格：根据 prompt 做简单处理"""
-    text = _remove_fillers(text)
-
-    if prompt and "json" in prompt.lower():
-        import json as _json
-        return _json.dumps({"text": text, "note": "custom styled"}, ensure_ascii=False)
-
-    if prompt and "大写" in prompt:
-        return text.upper()
-
-    return f"[{prompt or '自定义'}]: {text}"
+def get_stylizer(settings: Settings) -> Stylizer:
+    """根据配置返回 Stylizer 实例。未知名称时回退到规则实现。"""
+    provider_cls = _PROVIDERS.get(settings.llm_provider, RuleBasedStylizer)
+    return provider_cls()
