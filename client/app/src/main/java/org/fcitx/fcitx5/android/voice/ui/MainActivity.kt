@@ -3,8 +3,11 @@ package org.fcitx.fcitx5.android.voice.ui
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Toast
@@ -34,10 +37,21 @@ import org.fcitx.fcitx5.android.voice.databinding.ActivityMainBinding
  */
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        private const val PREFS_NAME = "voice_input_plugin_prefs"
+        private const val KEY_BASE_URL = "pref_base_url"
+        private const val DEFAULT_BASE_URL = "http://10.0.2.2:8080"
+    }
+
     private lateinit var binding: ActivityMainBinding
     private lateinit var viewModel: VoiceInputViewModel
     private lateinit var feedbackCollector: FeedbackCollector
-    private val feedbackService = RetrofitFeedbackService()
+    private lateinit var feedbackService: RetrofitFeedbackService
+
+    /** SharedPreferences（与插件 Service 共享） */
+    private val prefs: SharedPreferences by lazy {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+    }
 
     /** 录音权限请求 */
     private val requestPermissionLauncher = registerForActivityResult(
@@ -55,15 +69,19 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // 读取保存的服务端 URL
+        val savedUrl = prefs.getString(KEY_BASE_URL, DEFAULT_BASE_URL) ?: DEFAULT_BASE_URL
+
         // 创建依赖
         val audioRecorder = AndroidAudioRecorder()
-        val transcribeService = RetrofitTranscribeService()
+        val transcribeService = RetrofitTranscribeService(savedUrl)
         val commitTextHandler = ClipboardCommitTextHandler(this)
         val transcribeUseCase = TranscribeUseCase(
             audioRecorder = audioRecorder,
             transcribeService = transcribeService,
             commitTextHandler = commitTextHandler
         )
+        feedbackService = RetrofitFeedbackService(savedUrl)
 
         // 创建 ViewModel
         viewModel = VoiceInputViewModel(transcribeUseCase)
@@ -72,6 +90,7 @@ class MainActivity : AppCompatActivity() {
         feedbackCollector = FeedbackCollector()
 
         // 初始化 UI
+        setupServerUrlInput(savedUrl)
         setupStyleSelector()
         setupRecordButton()
         setupCopyButton()
@@ -79,6 +98,21 @@ class MainActivity : AppCompatActivity() {
         setupFeedbackSection()
         observeState()
         observeTranscriptionSession()
+    }
+
+    /** 设置服务端 URL 输入框 */
+    private fun setupServerUrlInput(savedUrl: String) {
+        binding.serverUrlInput.setText(savedUrl)
+        binding.serverUrlInput.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {
+                val url = s?.toString()?.trim() ?: DEFAULT_BASE_URL
+                if (url.isNotBlank()) {
+                    prefs.edit().putString(KEY_BASE_URL, url).apply()
+                }
+            }
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        })
     }
 
     /**

@@ -71,13 +71,30 @@ class AndroidAudioRecorder(
         }
 
         try {
-            val record = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
+            // 优先尝试 VOICE_RECOGNITION（模拟器兼容性更好），失败则回退到 MIC
+            val record = try {
+                val r = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    sampleRate, channelConfig, audioFormat, bufferSize
+                )
+                if (r.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.d(TAG, "使用 VOICE_RECOGNITION 音频源")
+                    r
+                } else {
+                    r.release()
+                    Log.w(TAG, "VOICE_RECOGNITION 不可用(state=${r.state})，回退到 MIC")
+                    AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        sampleRate, channelConfig, audioFormat, bufferSize
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "VOICE_RECOGNITION 失败，回退到 MIC: ${e.message}")
+                AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    sampleRate, channelConfig, audioFormat, bufferSize
+                )
+            }
 
             if (record.state != AudioRecord.STATE_INITIALIZED) {
                 throw RuntimeException("AudioRecord 初始化失败 (state=${record.state})")

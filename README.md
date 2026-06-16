@@ -10,15 +10,29 @@
 
 ```mermaid
 flowchart LR
-    User["🎤 用户语音"] --> Client["Client (Android / Kotlin)"]
-    Client -->|HTTP / JSON| Server["Server (Python / FastAPI)"]
+    User["🎤 用户语音"] --> Fcitx5["Fcitx5 Android 主应用"]
+    Fcitx5 -->|AIDL IPC 触发| Plugin["语音插件 (本仓库 client)"]
+    Plugin -->|HTTP / JSON| Server["Server (Python / FastAPI)"]
     Server --> ASR["ASR API (讯飞等)"]
     ASR --> Server
     Server --> LLM["LLM API 风格化"]
     LLM --> Server
-    Server --> Client
-    Client --> IM["⌨️ Fcitx5 上屏"]
+    Server --> Plugin
+    Plugin -->|AIDL 回调| Fcitx5
+    Fcitx5 -->|InputConnection| IM["⌨️ 目标应用上屏"]
 ```
+
+## 集成路径选择
+
+已确定采用 **A 路径：Fcitx5 Android 插件**。
+
+| 方案 | 说明 | 选择原因 |
+|---|---|---|
+| **A. Fcitx5 插件（AIDL IPC）** | 作为独立 APK 插件，通过 AIDL 与 Fcitx5 主应用通信 | ✅ 主应用持有 `InputConnection`，可直接上屏；便于收集用户修改反馈，形成数据闭环 |
+| B. AnySoftKeyboard | 通过系统 `RecognizerIntent` 调用外部语音 IME | ❌ 无法控制上屏流程，难以获取用户后续修改 |
+| C. 独立 App + 剪贴板 | 录音后写入剪贴板，用户手动粘贴 | ❌ 体验割裂，无反馈闭环 |
+
+插件侧代码（AIDL 接口、`VoiceInputPluginService`、录音与网络核心）已完成；后续主要工作在 **Fcitx5 Android 主应用侧** 集成语音按钮与回调处理。
 
 ## 技术选型
 
@@ -32,16 +46,25 @@ flowchart LR
 
 ```
 fcitx5-ai-voice-to-text-core/
-├── client/                  # Android 客户端（Kotlin 模块）
-│   └── (待开发)
+├── client/                  # Android 客户端（Fcitx5 插件）
+│   ├── app/                 # Android 应用模块（插件 APK）
+│   │   ├── src/main/
+│   │   │   ├── aidl/        # AIDL 接口：IVoiceInputPlugin / IVoiceInputCallback
+│   │   │   ├── java/        # bridge / data / ui
+│   │   │   └── res/         # 布局、字符串、Manifest
+│   │   └── build.gradle.kts
+│   ├── core/                # 纯 Kotlin 核心库（可单元测试）
+│   │   └── src/main/kotlin/...
+│   ├── PROGRESS.md          # 开发进度与路线规划
+│   └── ARCHITECTURE.md      # 客户端架构设计文档
 ├── server/                  # 服务端（Python / FastAPI）
-│   ├── app.py              # FastAPI 入口 / API 路由
-│   ├── asr.py              # ASR 转文字模块（当前固定模拟，后续接真实 API）
-│   ├── stylize.py          # 风格化模块（当前固定模拟，后续接 LLM API）
-│   ├── models.py           # Pydantic 数据模型
-│   └── environment.yml     # Conda 环境配置
+│   ├── app.py               # FastAPI 入口 / API 路由
+│   ├── asr.py               # ASR 转文字模块（当前固定模拟）
+│   ├── stylize.py           # 风格化模块（当前固定模拟）
+│   ├── models.py            # Pydantic 数据模型
+│   └── environment.yml      # Conda 环境配置
 ├── docs/
-│   └── protocol.md         # 通信协议说明
+│   └── protocol.md          # 通信协议说明
 └── README.md
 ```
 
@@ -86,43 +109,54 @@ fcitx5-ai-voice-to-text-core/
 ```bash
 cd server
 conda env create -f environment.yml
-conda activate fcitx5-voice
+conda activate v2t
 ```
 
 ### 2. 启动服务端
 
 ```bash
-# 确保 conda 环境已激活 (fcitx5-voice)
+# 确保 conda 环境已激活 (v2t)
 uvicorn server.app:app --reload --host 0.0.0.0 --port 8080
 ```
 
 > `--reload` 仅在开发阶段使用，修改代码后自动重启。
 
-### 3. 测试接口
+### 3. 构建并安装插件 APK
+
+```bash
+cd client
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew :app:assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
+```
+
+### 4. 测试接口
 
 ```bash
 # 健康检查
 curl http://localhost:8080/health
 
-# 转录测试 — 发送不同长度的音频数据，返回不同模拟结果
+# 转录测试
 curl -X POST http://localhost:8080/v1/transcribe \
   -H "Content-Type: application/json" \
   -d '{"audio": "AAECAw==", "style": "精简"}'
 
 # 返回示例：
-# {"text":"好的。","original_text":"好的","duration_ms":0,"error":null}
+# {"text":"[录音时长: 0ms] 好的。","original_text":"好的","duration_ms":0,"error":null}
 ```
 
 ## 后续规划（Roadmap）
 
-- [ ] **Phase 1** — 服务端 ASR + 风格化逻辑可独立运行（当前原型目标）
-- [ ] **Phase 2** — Kotlin Client 核心：录音 → 发送 → 接收 → 上屏
-- [ ] **Phase 3** — 封装为 Fcitx5 Android 插件
-- [ ] **Phase 4** — Fcitx5 Linux / Windows 插件封装
-- [ ] **Phase 5** — 自定义提示词模板管理 UI
-- [ ] **Phase 6** — 离线 ASR / 端侧小模型支持
+- [x] **Phase 1** — 服务端 ASR + 风格化逻辑可独立运行
+- [x] **Phase 2** — Kotlin Client 核心：录音 → 发送 → 接收 → 上屏
+- [x] **Phase 3** — 插件侧 AIDL 接口与 `VoiceInputPluginService` 实现
+- [ ] **Phase 4** — Fcitx5 Android 主应用集成：键盘按钮、bindService、回调上屏
+- [ ] **Phase 5** — 用户修改反馈闭环：采集上屏后编辑 → 优化风格化 prompt
+- [ ] **Phase 6** — Fcitx5 Linux / Windows 插件封装
+- [ ] **Phase 7** — 自定义提示词模板管理 UI
+- [ ] **Phase 8** — 离线 ASR / 端侧小模型支持
 
 ## 说明
 
-- 本项目为**核心协议与逻辑层**，不直接包含 Fcitx5 插件代码。
-- 各平台插件作为独立仓库，通过本项目定义的 Client API 进行对接。
+- 本项目为**核心协议与逻辑层** + **Fcitx5 Android 插件 APK**。
+- 当前插件侧代码可直接编译安装，但尚需 Fcitx5 Android 主应用配合才能在上屏流程中生效。
+- 各平台插件（Linux / Windows）作为独立仓库，通过本项目定义的 Client API 进行对接。

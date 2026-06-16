@@ -53,23 +53,39 @@ class VoiceInputPluginService : Service() {
         /** 默认转录风格 */
         private const val DEFAULT_STYLE = "正式"
 
+        /** 默认服务端 URL */
+        private const val DEFAULT_BASE_URL = "http://10.0.2.2:8080"
+
         /** SharedPreferences 文件名 */
         private const val PREFS_NAME = "voice_input_plugin_prefs"
 
         /** 风格持久化 key */
         private const val KEY_CURRENT_STYLE = "pref_current_style"
+
+        /** 服务端 URL key */
+        private const val KEY_BASE_URL = "pref_base_url"
     }
 
     // --- 依赖 ---
     private val audioRecorder = AndroidAudioRecorder()
-    private val transcribeService = RetrofitTranscribeService()
     private val commitTextHandler = NoOpCommitTextHandler()
-    private val transcribeUseCase = TranscribeUseCase(
+    private val sessionIdProvider: SessionIdProvider = SessionIdProvider.DEFAULT
+
+    /** 当前使用的 baseUrl（内部可变，通过 SharedPreferences 持久化） */
+    @Volatile
+    private var currentBaseUrl: String = DEFAULT_BASE_URL
+
+    /** 当前使用的 TranscribeService（baseUrl 变化时重新创建） */
+    @Volatile
+    private var transcribeService: RetrofitTranscribeService = RetrofitTranscribeService(currentBaseUrl)
+
+    /** TranscribeUseCase（baseUrl 变化时重新创建） */
+    @Volatile
+    private var transcribeUseCase: TranscribeUseCase = TranscribeUseCase(
         audioRecorder = audioRecorder,
         transcribeService = transcribeService,
         commitTextHandler = commitTextHandler
     )
-    private val sessionIdProvider: SessionIdProvider = SessionIdProvider.DEFAULT
 
     // --- 并发控制 ---
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -100,9 +116,21 @@ class VoiceInputPluginService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        // 恢复持久化的风格设置
+        // 恢复持久化的设置
         currentStyle = prefs.getString(KEY_CURRENT_STYLE, DEFAULT_STYLE) ?: DEFAULT_STYLE
-        Log.d(TAG, "Service 创建，恢复风格: $currentStyle")
+        currentBaseUrl = prefs.getString(KEY_BASE_URL, DEFAULT_BASE_URL) ?: DEFAULT_BASE_URL
+        rebuildTranscribeService()
+        Log.d(TAG, "Service 创建，baseUrl=$currentBaseUrl, style=$currentStyle")
+    }
+
+    /** 根据当前 baseUrl 重建 HTTP 客户端 */
+    private fun rebuildTranscribeService() {
+        transcribeService = RetrofitTranscribeService(currentBaseUrl)
+        transcribeUseCase = TranscribeUseCase(
+            audioRecorder = audioRecorder,
+            transcribeService = transcribeService,
+            commitTextHandler = commitTextHandler
+        )
     }
 
     /**
