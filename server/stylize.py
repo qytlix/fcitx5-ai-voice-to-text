@@ -150,9 +150,13 @@ class DeepSeekStylizer(Stylizer):
                 temperature=0.3,
                 max_tokens=500,
             )
-            result = response.choices[0].message.content.strip()
-            logger.debug(f"[DeepSeek] 风格化完成: {result[:100]}")
-            return result
+            result_content = response.choices[0].message.content
+            if result_content != None:
+                result = result_content.strip()
+                logger.debug(f"[DeepSeek] 风格化完成: {result[:100]}")
+                return result
+            else:
+                raise Exception("result_content empty")
         except Exception as e:
             error_msg = f"DeepSeek API 调用失败: {str(e)}"
             logger.error(f"[DeepSeek] {error_msg}")
@@ -163,7 +167,7 @@ class DeepSeekStylizer(Stylizer):
         style_instructions = {
             Style.FORMAL: "请将以下文本转换为正式书面语，移除口语表达和语气词，使用规范的词汇和表达方式。",
             Style.CONCISE: "请精简以下文本，保留核心信息，移除冗余和修饰词。",
-            Style.POLITE: "请使用礼貌用语重新表述以下文本，加入敬语（如"您"），表现出尊重和礼貌。",
+            Style.POLITE: "请使用礼貌用语重新表述以下文本，加入敬语（如“您”），表现出尊重和礼貌。",
             Style.TRANSLATE_EN: "请将以下中文文本翻译成英文，保留原意。",
             Style.CUSTOM: f"请按照以下要求处理文本：{custom_prompt or '无特殊要求'}",
         }
