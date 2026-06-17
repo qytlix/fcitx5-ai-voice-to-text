@@ -124,7 +124,9 @@ class RuleBasedStylizer(Stylizer):
         """自定义：按 prompt 关键字做简单处理。"""
         text = _remove_fillers(text)
         if prompt and "json" in prompt.lower():
-            return json.dumps({"text": text, "note": "custom styled"}, ensure_ascii=False)
+            return json.dumps(
+                {"text": text, "note": "custom styled"}, ensure_ascii=False
+            )
         if prompt and "大写" in prompt:
             return text.upper()
         return f"[{prompt or '自定义'}]: {text}"
@@ -162,14 +164,16 @@ class DeepSeekStylizer(Stylizer):
             logger.error(f"[DeepSeek] {error_msg}")
             raise StylizeError(error_msg)
 
-    def _build_style_prompt(self, text: str, style: Style, custom_prompt: Optional[str]) -> str:
+    def _build_style_prompt(
+        self, text: str, style: Style, custom_prompt: Optional[str]
+    ) -> str:
         """根据风格构造 prompt。"""
         style_instructions = {
-            Style.FORMAL: “请将以下文本转换为正式书面语，移除口语表达和语气词，使用规范的词汇和表达方式。”,
-            Style.CONCISE: “请精简以下文本，保留核心信息，移除冗余和修饰词。”,
-            Style.POLITE: “请使用礼貌用语重新表述以下文本，加入敬语（如'您'），表现出尊重和礼貌。”,
-            Style.TRANSLATE_EN: “请将以下中文文本翻译成英文，保留原意。”,
-            Style.CUSTOM: f”请按照以下要求处理文本：{custom_prompt or '无特殊要求'}”,
+            Style.FORMAL: "请将以下文本转换为正式书面语，移除口语表达和语气词，使用规范的词汇和表达方式。",
+            Style.CONCISE: "请精简以下文本，保留核心信息，移除冗余和修饰词。",
+            Style.POLITE: "请使用礼貌用语重新表述以下文本，加入敬语（如'您'），表现出尊重和礼貌。",
+            Style.TRANSLATE_EN: "请将以下中文文本翻译成英文，保留原意。",
+            Style.CUSTOM: f"请按照以下要求处理文本：{custom_prompt or '无特殊要求'}",
         }
 
         instruction = style_instructions.get(style, "请处理以下文本。")
