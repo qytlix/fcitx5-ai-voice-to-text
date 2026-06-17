@@ -68,10 +68,16 @@ fcitx5-ai-voice-to-text-core/
 │   ├── requirements.txt     # Python 依赖
 │   └── environment.yml      # Conda 环境配置
 ├── .env.example             # 环境变量模板（复制为 .env 后填值）
-├── Dockerfile               # Docker 镜像定义
-├── docker-compose.yml       # Docker Compose 编排
-├── API.md                   # 服务端 API 文档
-├── DOCKER.md                # Docker 部署指南
+├── deploy/                  # Docker 部署配置
+│   ├── Dockerfile           # Docker 镜像定义
+│   ├── docker-compose.yml   # Docker Compose 编排
+│   └── .dockerignore        # Docker 忽略规则
+├── docs/                    # 文档
+│   ├── API.md               # 服务端 API 文档
+│   ├── DOCKER.md            # Docker 部署指南
+│   └── xfyun使用说明.md      # 讯飞集成说明
+├── test/                    # 测试脚本
+│   └── test_xunfei.py       # 讯飞 ASR 测试
 ├── CLAUDE.md                # 开发指南
 └── README.md                # 本文件
 ```
@@ -150,13 +156,13 @@ cp .env.example .env
 # 编辑 .env 填入讯飞凭证
 
 # 3. 启动服务
-docker-compose up -d
+docker compose -f deploy/docker-compose.yml up -d
 
 # 4. 验证服务
 curl http://localhost:8080/health
 ```
 
-详见 [DOCKER.md](DOCKER.md) 和 [API.md](API.md)。
+详见 [docs/DOCKER.md](docs/DOCKER.md) 和 [docs/API.md](docs/API.md)。
 
 ### 本地开发
 
@@ -167,7 +173,7 @@ source .venv/bin/activate  # Linux/Mac
 .venv\Scripts\activate      # Windows
 
 # 安装依赖
-pip install -r requirements.txt
+pip install -r server/requirements.txt
 
 # 配置环境变量
 cp .env.example .env
@@ -186,7 +192,7 @@ curl -X POST http://localhost:8080/v1/transcribe \
   -d '{"audio": "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAAB9AAACABAAZGF0YQIAAAAAAA==", "style": "正式"}'
 ```
 
-更多示例见 [API.md](API.md)。
+更多示例见 [docs/API.md](docs/API.md)。
 
 ### 构建 Android 客户端
 
@@ -206,6 +212,8 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 - [ ] **Phase 6** — Fcitx5 Linux / Windows 插件封装
 - [ ] **Phase 7** — 自定义提示词模板管理 UI
 - [ ] **Phase 8** — 离线 ASR / 端侧小模型支持
+
+> **注意**: `docs/` 和 `deploy/` 目录是在文件整理后添加的结构。Docker 相关命令中 `Dockerfile` 和 `docker-compose.yml` 的路径已更新为 `deploy/` 前缀。
 
 ## 说明
 

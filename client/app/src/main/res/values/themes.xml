@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <style name="Theme.VoiceInput" parent="Theme.AppCompat.Light.NoActionBar">
-        <item name="colorPrimary">#FF6200EE</item>
-        <item name="colorPrimaryDark">#FF3700B3</item>
-        <item name="colorAccent">#FF03DAC5</item>
-        <item name="android:statusBarColor">#FF3700B3</item>
-    </style>
-</resources>
