@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""测试讯飞 RAASR ASR 集成。"""
+"""测试讯飞 IAT WebSocket ASR 集成。"""
 
 import json
 import requests
@@ -12,7 +12,7 @@ TEST_AUDIO_BASE64 = "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAAB9AAACABAAZGF0YQIAAAA
 
 def test_transcribe():
     """测试 /v1/transcribe 端点。"""
-    print("=== Test Xunfei RAASR ASR ===")
+    print("=== Test Xunfei IAT WebSocket ASR ===")
 
     payload = {
         "audio": TEST_AUDIO_BASE64,

@@ -3,7 +3,7 @@
 ## 概览
 
 本服务为 Fcitx5 输入法提供语音转文字和文本风格化的 REST API。
-- **语音识别**：集成讯飞 RAASR（Recording Auto Acknowledgement Speech Recognition）
+- **语音识别**：集成讯飞 IAT（语音听写流式版）WebSocket API
 - **文本风格化**：支持正式、精简、礼貌、英文翻译、自定义等多种风格
 - **部署**：Docker Compose 一键启动
 
@@ -195,11 +195,11 @@ GET /v1/feedback/count
 在 `.env` 或 Docker 环境变量中配置：
 
 ```ini
-# 讯飞 RAASR API 凭证（必需）
+# 讯飞 IAT API 凭证（必需）
 ASR_PROVIDER=xunfei
-ASR_API_KEY=your_appid_here
-ASR_API_SECRET=your_secret_key_here
-ASR_API_PASSWORD=your_secret_key_here
+ASR_API_KEY=your_appid_here              # 讯飞应用 ID (app_id)
+ASR_API_SECRET=your_api_key_here         # 讯飞 API Key (api_key)
+ASR_API_PASSWORD=your_api_secret_here    # 讯飞 API Secret (api_secret)
 
 # LLM 风格化提供方
 LLM_PROVIDER=mock                    # mock | deepseek
@@ -220,7 +220,7 @@ APP_ENV=production                   # production | development
 ### 获取讯飞凭证
 
 1. 访问 [讯飞开放平台](https://www.xfyun.cn/)
-2. 创建应用，选择 **RAASR（录音文件识别）** 服务
+2. 创建应用，选择 **语音听写（流式版）** 服务
 3. 获取 `APPID`、`API_KEY`、`API_SECRET`
 4. 填入 `.env`
 
@@ -308,7 +308,7 @@ client.newCall(request).execute().use { response ->
 | 指标 | 值 |
 |------|-----|
 | 单次请求延迟 | ~2-5s（取决于讯飞 API） |
-| 最大音频时长 | 受 MAX_AUDIO_MB 限制，默认 10MB（~2 分钟 16kHz PCM） |
+| 最大音频时长 | 受讯飞 IAT 限制，最长 60 秒；同时受 MAX_AUDIO_MB 限制，默认 10MB |
 | 并发处理能力 | 取决于 Docker 内存/CPU 分配 |
 | 反馈存储 | 无限制，JSONL 文件追加模式 |
 
@@ -373,7 +373,7 @@ ffmpeg -i input.mp3 -acodec pcm_s16le -ar 16000 output.wav
 | Docker 部署 | [DOCKER.md](DOCKER.md) |
 | 本 API 文档 | [API.md](API.md) |
 | 项目架构 | [README.md](README.md) |
-| 讯飞 RAASR 文档 | https://www.xfyun.cn/doc/asr/raasr_api.html |
+| 讯飞 IAT 文档 | https://www.xfyun.cn/doc/asr/voicedictation.html |
 
 ---
 
@@ -381,7 +381,7 @@ ffmpeg -i input.mp3 -acodec pcm_s16le -ar 16000 output.wav
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-| 0.1.0 | 2026-06-16 | 初始版本，Xunfei RAASR HTTP REST 集成完成 |
+| 0.1.0 | 2026-06-16 | 初始版本，Xunfei IAT WebSocket 集成完成 |
 
 ---
 

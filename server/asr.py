@@ -19,13 +19,14 @@ import hashlib
 import hmac
 import json
 import logging
+import ssl
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from email.utils import formatdate
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import quote
 
-import requests
+import websocket
 
 from .audio_utils import AudioProcessError, decode_audio, get_audio_duration_ms
 from .config import Settings
@@ -72,9 +73,9 @@ class MockASRProvider(ASRProvider):
 
 class XunfeiASRProvider(ASRProvider):
     """
-    讯飞 RAASR（录音文件转写）HTTP REST API 实现。
+    讯飞 IAT（语音听写流式版）WebSocket API 实现。
 
-    文档: https://www.xfyun.cn/doc/asr/voicetranscrip_api.html
+    文档: xfyun使用说明.md
 
     配置项（来自 .env）：
         - ASR_API_KEY: APP_ID
@@ -82,13 +83,18 @@ class XunfeiASRProvider(ASRProvider):
         - ASR_API_PASSWORD: API_SECRET
     """
 
-    # 讯飞 RAASR API 端点
-    XUNFEI_UPLOAD_URL = "https://raasr.xfyun.cn/v2/api/upload"
-    XUNFEI_QUERY_URL = "https://raasr.xfyun.cn/v2/api/getResult"
+    XUNFEI_HOST = "iat.xf-yun.com"
+    XUNFEI_PATH = "/v1"
+    XUNFEI_URL = f"wss://{XUNFEI_HOST}{XUNFEI_PATH}"
+
+    # 流式分包：40ms/次，每次 1280 字节（16kHz 16bit 单声道）
+    FRAME_SIZE = 1280
+    INTERVAL_MS = 40
+    MAX_AUDIO_SECONDS = 60
 
     def __init__(self, app_id: str, api_key: str, api_secret: str):
         """
-        初始化讯飞 RAASR ASR。
+        初始化讯飞 IAT ASR。
 
         Args:
             app_id: 讯飞应用 ID
@@ -97,7 +103,7 @@ class XunfeiASRProvider(ASRProvider):
         """
         if not all([app_id, api_key, api_secret]):
             raise ASRError(
-                "讯飞 RAASR 认证信息不完整。"
+                "讯飞 IAT 认证信息不完整。"
                 "请在 .env 中配置 ASR_API_KEY (app_id), "
                 "ASR_API_SECRET (api_key), ASR_API_PASSWORD (api_secret)"
             )
@@ -106,178 +112,237 @@ class XunfeiASRProvider(ASRProvider):
         self.api_secret = api_secret
 
     def transcribe(self, audio_base64: str) -> str:
-        """调用讯飞 RAASR API 进行语音识别。"""
+        """调用讯飞 IAT WebSocket API 进行语音识别。"""
         try:
-            # 解码音频（验证格式、获取 PCM 数据）
-            pcm_array, sample_rate = decode_audio(audio_base64)
-            logger.debug(f"[Xunfei] 解码音频完成: {len(pcm_array)} samples @ {sample_rate} Hz")
+            pcm_bytes, sample_rate = decode_audio(audio_base64)
+            logger.debug(
+                f"[Xunfei] 解码音频完成: {len(pcm_bytes)} bytes @ {sample_rate} Hz"
+            )
 
-            # 获取识别用的原始音频（讯飞需要原始的 bytes）
-            raw_bytes = base64.b64decode(audio_base64)
-
-            # 调用 RAASR API（上传 → 查询）
-            result = self._call_xunfei_raasr_api(raw_bytes)
+            result = self._call_xunfei_iat_api(pcm_bytes, sample_rate)
             logger.info(f"[Xunfei] 识别完成: {result[:100]}")
             return result
 
         except AudioProcessError as e:
             raise ASRError(f"音频解码失败: {e}")
+        except ASRError:
+            raise
+        except websocket.WebSocketException as e:
+            raise ASRError(f"讯飞 WebSocket 连接失败: {e}")
         except Exception as e:
-            raise ASRError(f"讯飞 RAASR 调用失败: {e}")
+            raise ASRError(f"讯飞 IAT 调用失败: {e}")
 
-    def _call_xunfei_raasr_api(self, audio_bytes: bytes) -> str:
+    def _call_xunfei_iat_api(self, pcm_bytes: bytes, sample_rate: int) -> str:
         """
-        调用讯飞 RAASR API 完整流程：上传 → 查询。
+        调用讯飞 IAT WebSocket API 完整流程。
 
-        讯飞 RAASR 采用异步模式：先上传音频文件，获得 file_id，然后轮询查询结果。
+        1. 建立 wss 连接并握手鉴权；
+        2. 按首帧 / 中间帧 / 末帧分包发送音频；
+        3. 接收服务端推送的识别结果并拼接文本。
         """
-        # 步骤 1: 上传音频文件
-        logger.debug(f"[Xunfei] 上传音频文件 ({len(audio_bytes)} bytes)")
-        upload_result = self._upload_audio(audio_bytes)
-        file_id = upload_result.get("file_id")
-        order_id = upload_result.get("order_id")
+        if sample_rate not in (8000, 16000):
+            raise ASRError(
+                f"讯飞 IAT 仅支持 8kHz 或 16kHz 采样率，当前为 {sample_rate}Hz"
+            )
 
-        if not file_id or not order_id:
-            raise ASRError(f"上传失败：未获得 file_id/order_id")
+        max_bytes = self.MAX_AUDIO_SECONDS * sample_rate * 2
+        if len(pcm_bytes) > max_bytes:
+            raise ASRError(
+                f"音频时长超过 {self.MAX_AUDIO_SECONDS} 秒限制"
+            )
 
-        logger.debug(f"[Xunfei] 上传成功: file_id={file_id}, order_id={order_id}")
-
-        # 步骤 2: 轮询查询结果
-        max_retries = 120  # 最多等待 120 秒（每秒查询一次）
-        for attempt in range(max_retries):
-            query_result = self._query_result(file_id, order_id)
-            status = query_result.get("status")
-
-            if status == 9:  # 识别完成
-                text = query_result.get("lattice", "")
-                if text:
-                    logger.debug(f"[Xunfei] 识别完成 (attempt {attempt + 1})")
-                    return text
-                else:
-                    raise ASRError("识别完成但返回空文本")
-
-            elif status in [0, 1, 2]:  # 处理中
-                if attempt % 10 == 0:
-                    logger.debug(f"[Xunfei] 处理中... (attempt {attempt + 1})")
-                time.sleep(1)
-
-            else:  # 其他错误状态
-                raise ASRError(f"识别失败: status={status}, {query_result.get('failreason', '')}")
-
-        raise ASRError("识别超时（120秒内未返回结果）")
-
-    def _upload_audio(self, audio_bytes: bytes) -> dict:
-        """上传音频文件到讯飞。"""
-        timestamp = str(int(time.time()))
-        auth_header = self._generate_auth_header("POST", self.XUNFEI_UPLOAD_URL, timestamp)
-
-        headers = {
-            "Authorization": auth_header,
-            "X-Appid": self.app_id,
-            "Content-Type": "application/octet-stream",
-        }
-
-        # 构造请求参数
-        params = {
-            "app_id": self.app_id,
-            "file_len": len(audio_bytes),
-            "file_name": "audio.wav",
-            "slice_num": 1,
-            "slice_id": 0,
-        }
+        ws_url = self._build_auth_url()
+        ws = websocket.create_connection(
+            ws_url,
+            sslopt={"cert_reqs": ssl.CERT_NONE},
+            timeout=30,
+        )
 
         try:
-            response = requests.post(
-                self.XUNFEI_UPLOAD_URL,
-                params=params,
-                data=audio_bytes,
-                headers=headers,
-                timeout=30,
-            )
-            response.raise_for_status()
+            self._send_audio_frames(ws, pcm_bytes, sample_rate)
+            return self._receive_results(ws)
+        finally:
+            ws.close()
 
-            result_data = response.json()
-            logger.debug(f"[Xunfei] 上传响应: {result_data}")
+    def _build_auth_url(self) -> str:
+        """按文档生成带鉴权参数的 WebSocket URL。"""
+        date = formatdate(timeval=None, localtime=False, usegmt=True)
 
-            if result_data.get("code") != 0:
-                error_msg = result_data.get("message", "未知错误")
-                raise ASRError(f"上传失败: {error_msg}")
-
-            return {
-                "file_id": result_data.get("data", {}).get("file_id"),
-                "order_id": result_data.get("data", {}).get("order_id"),
-            }
-
-        except requests.RequestException as e:
-            raise ASRError(f"上传网络请求失败: {e}")
-
-    def _query_result(self, file_id: str, order_id: str) -> dict:
-        """查询识别结果。"""
-        timestamp = str(int(time.time()))
-        auth_header = self._generate_auth_header("POST", self.XUNFEI_QUERY_URL, timestamp)
-
-        headers = {
-            "Authorization": auth_header,
-            "X-Appid": self.app_id,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-
-        params = {
-            "app_id": self.app_id,
-            "file_id": file_id,
-            "order_id": order_id,
-            "status": 3,  # 3 表示查询识别结果
-        }
-
-        try:
-            response = requests.post(
-                self.XUNFEI_QUERY_URL,
-                params=params,
-                headers=headers,
-                timeout=30,
-            )
-            response.raise_for_status()
-
-            result_data = response.json()
-            logger.debug(f"[Xunfei] 查询响应: status={result_data.get('code')}")
-
-            if result_data.get("code") != 0:
-                error_msg = result_data.get("message", "未知错误")
-                raise ASRError(f"查询失败: {error_msg}")
-
-            return result_data.get("data", {})
-
-        except requests.RequestException as e:
-            raise ASRError(f"查询网络请求失败: {e}")
-
-    def _generate_auth_header(self, method: str, url: str, timestamp: str) -> str:
-        """
-        生成讯飞认证头（HMAC-SHA1）。
-
-        对于 RAASR API，签名内容为：
-        method + \n + url_path + \n + app_id + timestamp
-        """
-        # 提取 URL path
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        url_path = parsed.path
-
-        # 构造签名字符串
-        sign_str = f"{method}\n{url_path}\n{self.app_id}{timestamp}"
-
-        # HMAC-SHA1 签名
-        sign_bytes = hmac.new(
+        signature_origin = (
+            f"host: {self.XUNFEI_HOST}\n"
+            f"date: {date}\n"
+            f"GET {self.XUNFEI_PATH} HTTP/1.1"
+        )
+        signature_sha = hmac.new(
             self.api_secret.encode("utf-8"),
-            sign_str.encode("utf-8"),
-            hashlib.sha1,
+            signature_origin.encode("utf-8"),
+            hashlib.sha256,
         ).digest()
+        signature = base64.b64encode(signature_sha).decode("utf-8")
 
-        # Base64 编码
-        sign_b64 = base64.b64encode(sign_bytes).decode("utf-8")
+        authorization_origin = (
+            f'api_key="{self.api_key}", '
+            f'algorithm="hmac-sha256", '
+            f'headers="host date request-line", '
+            f'signature="{signature}"'
+        )
+        authorization = base64.b64encode(
+            authorization_origin.encode("utf-8")
+        ).decode("utf-8")
 
-        # 构造认证头
-        auth_header = f"api_key=\"{self.api_key}\",algorithm=\"hmac-sha1\",timestamp=\"{timestamp}\",signature=\"{sign_b64}\""
-        return auth_header
+        return (
+            f"{self.XUNFEI_URL}?"
+            f"authorization={authorization}"
+            f"&date={quote(date, safe='')}"
+            f"&host={self.XUNFEI_HOST}"
+        )
+
+    def _send_audio_frames(
+        self, ws: websocket.WebSocket, pcm_bytes: bytes, sample_rate: int
+    ) -> None:
+        """按文档规范分包发送音频帧。"""
+        seq = 1
+        total = len(pcm_bytes)
+
+        # 首帧：携带服务参数
+        first_frame = {
+            "header": {
+                "app_id": self.app_id,
+                "status": 0,
+            },
+            "parameter": {
+                "iat": {
+                    "domain": "slm",
+                    "language": "zh_cn",
+                    "accent": "mandarin",
+                    "eos": 6000,
+                    "dwa": "wpgs",
+                    "result": {
+                        "encoding": "utf8",
+                        "compress": "raw",
+                        "format": "json",
+                    },
+                }
+            },
+            "payload": {
+                "audio": {
+                    "encoding": "raw",
+                    "sample_rate": sample_rate,
+                    "channels": 1,
+                    "bit_depth": 16,
+                    "seq": seq,
+                    "status": 0,
+                    "audio": base64.b64encode(
+                        pcm_bytes[: self.FRAME_SIZE]
+                    ).decode("utf-8"),
+                }
+            },
+        }
+        ws.send(json.dumps(first_frame))
+        seq += 1
+
+        # 中间帧
+        offset = self.FRAME_SIZE
+        while offset < total:
+            end = min(offset + self.FRAME_SIZE, total)
+            is_last = end == total
+            status = 2 if is_last else 1
+
+            frame = {
+                "header": {"app_id": self.app_id, "status": status},
+                "payload": {
+                    "audio": {
+                        "encoding": "raw",
+                        "sample_rate": sample_rate,
+                        "channels": 1,
+                        "bit_depth": 16,
+                        "seq": seq,
+                        "status": status,
+                        "audio": base64.b64encode(pcm_bytes[offset:end]).decode(
+                            "utf-8"
+                        ),
+                    }
+                },
+            }
+            ws.send(json.dumps(frame))
+            seq += 1
+            offset = end
+
+            if not is_last:
+                time.sleep(self.INTERVAL_MS / 1000)
+
+        # 如果音频为空或首帧已发完，补发空末帧
+        if total == 0 or total <= self.FRAME_SIZE:
+            last_frame = {
+                "header": {"app_id": self.app_id, "status": 2},
+                "payload": {
+                    "audio": {
+                        "encoding": "raw",
+                        "sample_rate": sample_rate,
+                        "channels": 1,
+                        "bit_depth": 16,
+                        "seq": seq,
+                        "status": 2,
+                        "audio": "",
+                    }
+                },
+            }
+            ws.send(json.dumps(last_frame))
+
+    def _receive_results(self, ws: websocket.WebSocket) -> str:
+        """接收识别结果，处理动态修正（wpgs）并拼接最终文本。"""
+        result_parts: list[str] = []
+        while True:
+            try:
+                message = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                raise ASRError("等待识别结果超时")
+            
+            if isinstance(message, bytes):
+                message = message.decode("utf-8")
+
+            data = json.loads(message)
+            header = data.get("header", {})
+            code = header.get("code")
+            if code != 0:
+                raise ASRError(
+                    f"识别错误: code={code}, message={header.get('message', '未知错误')}"
+                )
+
+            status = header.get("status")
+            payload = data.get("payload", {})
+            result = payload.get("result", {})
+
+            if "text" in result:
+                text_b64 = result["text"]
+                text_json = base64.b64decode(text_b64).decode("utf-8")
+                text_data = json.loads(text_json)
+
+                partial = self._extract_text(text_data)
+                pgs = text_data.get("pgs")
+
+                if pgs == "rpl":
+                    # 替换前面若干段结果
+                    rg = text_data.get("rg", [1, len(result_parts)])
+                    start, end = max(0, rg[0] - 1), max(0, rg[1])
+                    result_parts = result_parts[:start]
+                    result_parts.append(partial)
+                else:
+                    # apd 或普通结果，直接追加
+                    result_parts.append(partial)
+
+            if status == 2:
+                return "".join(result_parts)
+
+    def _extract_text(self, text_data: dict) -> str:
+        """从 text 字段解码后的 JSON 中提取字词文本。"""
+        words = []
+        for ws_item in text_data.get("ws", []):
+            for cw in ws_item.get("cw", []):
+                w = cw.get("w")
+                if w:
+                    words.append(w)
+        return "".join(words)
 
 
 # provider 名称 → (构造函数, 参数列表)
