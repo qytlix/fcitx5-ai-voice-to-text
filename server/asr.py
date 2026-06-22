@@ -4,7 +4,7 @@ ASR（自动语音识别）层：音频 → 文字。
 设计为「可插拔 provider」：
     - ASRProvider 是抽象基类，定义统一接口 transcribe()。
     - MockASRProvider 是原型阶段的假实现（不调用外部 API）。
-    - XunfeiASRProvider 是讯飞 IAT API 实现。
+    - XunfeiASRProvider 是讯飞「语音听写（流式版）v2」API 实现。
     - get_asr_provider() 是工厂，根据配置里的 asr_provider 返回对应实例。
 
 接入真实 ASR 时，只需：
@@ -20,15 +20,15 @@ import hmac
 import json
 import logging
 import ssl
+import threading
 import time
 from abc import ABC, abstractmethod
 from email.utils import formatdate
-from typing import Optional
 from urllib.parse import quote
 
 import websocket
 
-from .audio_utils import AudioProcessError, decode_audio, get_audio_duration_ms
+from .audio_utils import AudioProcessError, decode_audio
 from .config import Settings
 
 logger = logging.getLogger(__name__)
@@ -73,39 +73,45 @@ class MockASRProvider(ASRProvider):
 
 class XunfeiASRProvider(ASRProvider):
     """
-    讯飞 IAT（语音听写流式版）WebSocket API 实现。
+    讯飞「语音听写（流式版）v2」WebSocket API 实现。
 
-    文档: xfyun使用说明.md
+    接口: wss://iat-api.xfyun.cn/v2/iat
+    文档: https://www.xfyun.cn/doc/asr/voicedictation/API.html
 
-    配置项（来自 .env）：
+    说明：此前用的是「中文识别大模型」接口（iat.xf-yun.com/v1，domain=slm），
+    但该服务需单独开通授权，未开通会返回 11201 licc failed。改用「语音听写
+    流式版」接口，对应控制台「语音听写」服务（默认带免费额度）。
+
+    配置项（来自 .env，字段名沿用历史命名）：
         - ASR_API_KEY: APP_ID
-        - ASR_API_SECRET: API_KEY
-        - ASR_API_PASSWORD: API_SECRET
+        - ASR_API_SECRET: APIKey
+        - ASR_API_PASSWORD: APISecret
     """
 
-    XUNFEI_HOST = "iat.xf-yun.com"
-    XUNFEI_PATH = "/v1"
+    XUNFEI_HOST = "iat-api.xfyun.cn"
+    XUNFEI_PATH = "/v2/iat"
     XUNFEI_URL = f"wss://{XUNFEI_HOST}{XUNFEI_PATH}"
 
     # 流式分包：40ms/次，每次 1280 字节（16kHz 16bit 单声道）
     FRAME_SIZE = 1280
     INTERVAL_MS = 40
     MAX_AUDIO_SECONDS = 60
+    RECV_TIMEOUT = 30
 
     def __init__(self, app_id: str, api_key: str, api_secret: str):
         """
         初始化讯飞 IAT ASR。
 
         Args:
-            app_id: 讯飞应用 ID
-            api_key: 讯飞 API Key
-            api_secret: 讯飞 API Secret
+            app_id: 讯飞应用 APPID
+            api_key: 讯飞 APIKey
+            api_secret: 讯飞 APISecret
         """
         if not all([app_id, api_key, api_secret]):
             raise ASRError(
                 "讯飞 IAT 认证信息不完整。"
-                "请在 .env 中配置 ASR_API_KEY (app_id), "
-                "ASR_API_SECRET (api_key), ASR_API_PASSWORD (api_secret)"
+                "请在 .env 中配置 ASR_API_KEY (APPID), "
+                "ASR_API_SECRET (APIKey), ASR_API_PASSWORD (APISecret)"
             )
         self.app_id = app_id
         self.api_key = api_key
@@ -134,11 +140,16 @@ class XunfeiASRProvider(ASRProvider):
 
     def _call_xunfei_iat_api(self, pcm_bytes: bytes, sample_rate: int) -> str:
         """
-        调用讯飞 IAT WebSocket API 完整流程。
+        调用讯飞 IAT v2 WebSocket API 完整流程。
 
         1. 建立 wss 连接并握手鉴权；
-        2. 按首帧 / 中间帧 / 末帧分包发送音频；
-        3. 接收服务端推送的识别结果并拼接文本。
+        2. 起一个接收线程边收结果（动态修正 wpgs）；
+        3. 主线程按首帧 / 中间帧 / 末帧分包发送音频；
+        4. 汇总各分片结果，按序号拼接成最终文本。
+
+        采用「边发边收」而非「先发完再收」：讯飞在识别过程中就会持续推送结果，
+        若中途出错也会立即下推错误码并关闭连接，独立接收线程能拿到错误原因，
+        而不是让发送循环因连接被中止抛出无意义的 WinError 10053。
         """
         if sample_rate not in (8000, 16000):
             raise ASRError(
@@ -147,22 +158,22 @@ class XunfeiASRProvider(ASRProvider):
 
         max_bytes = self.MAX_AUDIO_SECONDS * sample_rate * 2
         if len(pcm_bytes) > max_bytes:
-            raise ASRError(
-                f"音频时长超过 {self.MAX_AUDIO_SECONDS} 秒限制"
-            )
+            raise ASRError(f"音频时长超过 {self.MAX_AUDIO_SECONDS} 秒限制")
 
         ws_url = self._build_auth_url()
         ws = websocket.create_connection(
             ws_url,
             sslopt={"cert_reqs": ssl.CERT_NONE},
-            timeout=30,
+            timeout=self.RECV_TIMEOUT,
         )
 
         try:
-            self._send_audio_frames(ws, pcm_bytes, sample_rate)
-            return self._receive_results(ws)
+            return self._stream(ws, pcm_bytes, sample_rate)
         finally:
-            ws.close()
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def _build_auth_url(self) -> str:
         """按文档生成带鉴权参数的 WebSocket URL。"""
@@ -197,147 +208,159 @@ class XunfeiASRProvider(ASRProvider):
             f"&host={self.XUNFEI_HOST}"
         )
 
-    def _send_audio_frames(
+    def _stream(
         self, ws: websocket.WebSocket, pcm_bytes: bytes, sample_rate: int
+    ) -> str:
+        """边发边收：发送音频帧的同时由接收线程收集识别结果。"""
+        # sn（结果序号）→ 该片文本。用 dict 以便动态修正（wpgs）时按序号替换。
+        result_map: dict[int, str] = {}
+        error: dict[str, str] = {}
+        audio_format = f"audio/L16;rate={sample_rate}"
+
+        def receiver() -> None:
+            while True:
+                try:
+                    message = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    error["msg"] = "等待识别结果超时"
+                    return
+                except Exception as e:
+                    # 连接被服务端关闭等：若已收到错误码则以错误码为准
+                    if not error:
+                        error["msg"] = f"接收识别结果失败: {e}"
+                    return
+
+                if not message:
+                    return
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8")
+
+                data = json.loads(message)
+                code = data.get("code")
+                if code != 0:
+                    error["msg"] = (
+                        f"识别错误: code={code}, "
+                        f"message={data.get('message', '未知错误')}"
+                    )
+                    return
+
+                payload = data.get("data") or {}
+                result = payload.get("result") or {}
+                if result:
+                    self._merge_result(result, result_map)
+
+                if payload.get("status") == 2:
+                    return
+
+        rt = threading.Thread(target=receiver, daemon=True)
+        rt.start()
+
+        try:
+            self._send_audio_frames(ws, pcm_bytes, audio_format)
+        except Exception as e:
+            # 发送中断时，优先让接收线程把服务端的错误原因拿回来
+            rt.join(timeout=self.RECV_TIMEOUT)
+            if error:
+                raise ASRError(error["msg"])
+            raise ASRError(f"发送音频失败: {e}")
+
+        rt.join(timeout=self.RECV_TIMEOUT)
+        if rt.is_alive():
+            raise ASRError("等待识别结果超时")
+        if error:
+            raise ASRError(error["msg"])
+
+        return "".join(result_map[sn] for sn in sorted(result_map))
+
+    def _send_audio_frames(
+        self, ws: websocket.WebSocket, pcm_bytes: bytes, audio_format: str
     ) -> None:
-        """按文档规范分包发送音频帧。"""
-        seq = 1
+        """按 v2 协议分包发送音频帧（首帧带参数，末帧 status=2）。"""
         total = len(pcm_bytes)
 
-        # 首帧：携带服务参数
+        # 首帧：携带 common / business 参数
         first_frame = {
-            "header": {
-                "app_id": self.app_id,
+            "common": {"app_id": self.app_id},
+            "business": {
+                "language": "zh_cn",
+                "domain": "iat",
+                "accent": "mandarin",
+                "vad_eos": 10000,
+                "dwa": "wpgs",  # 开启动态修正
+            },
+            "data": {
                 "status": 0,
-            },
-            "parameter": {
-                "iat": {
-                    "domain": "slm",
-                    "language": "zh_cn",
-                    "accent": "mandarin",
-                    "eos": 6000,
-                    "dwa": "wpgs",
-                    "result": {
-                        "encoding": "utf8",
-                        "compress": "raw",
-                        "format": "json",
-                    },
-                }
-            },
-            "payload": {
-                "audio": {
-                    "encoding": "raw",
-                    "sample_rate": sample_rate,
-                    "channels": 1,
-                    "bit_depth": 16,
-                    "seq": seq,
-                    "status": 0,
-                    "audio": base64.b64encode(
-                        pcm_bytes[: self.FRAME_SIZE]
-                    ).decode("utf-8"),
-                }
+                "format": audio_format,
+                "encoding": "raw",
+                "audio": base64.b64encode(pcm_bytes[: self.FRAME_SIZE]).decode(
+                    "utf-8"
+                ),
             },
         }
         ws.send(json.dumps(first_frame))
-        seq += 1
 
-        # 中间帧
+        # 中间帧 / 末帧
         offset = self.FRAME_SIZE
         while offset < total:
             end = min(offset + self.FRAME_SIZE, total)
             is_last = end == total
             status = 2 if is_last else 1
-
             frame = {
-                "header": {"app_id": self.app_id, "status": status},
-                "payload": {
-                    "audio": {
-                        "encoding": "raw",
-                        "sample_rate": sample_rate,
-                        "channels": 1,
-                        "bit_depth": 16,
-                        "seq": seq,
-                        "status": status,
-                        "audio": base64.b64encode(pcm_bytes[offset:end]).decode(
-                            "utf-8"
-                        ),
-                    }
-                },
+                "data": {
+                    "status": status,
+                    "format": audio_format,
+                    "encoding": "raw",
+                    "audio": base64.b64encode(pcm_bytes[offset:end]).decode(
+                        "utf-8"
+                    ),
+                }
             }
             ws.send(json.dumps(frame))
-            seq += 1
             offset = end
-
             if not is_last:
                 time.sleep(self.INTERVAL_MS / 1000)
 
-        # 如果音频为空或首帧已发完，补发空末帧
-        if total == 0 or total <= self.FRAME_SIZE:
-            last_frame = {
-                "header": {"app_id": self.app_id, "status": 2},
-                "payload": {
-                    "audio": {
-                        "encoding": "raw",
-                        "sample_rate": sample_rate,
-                        "channels": 1,
-                        "bit_depth": 16,
-                        "seq": seq,
-                        "status": 2,
-                        "audio": "",
+        # 音频不足一帧（首帧已发完整段）时，补一个空末帧通知结束
+        if total <= self.FRAME_SIZE:
+            ws.send(
+                json.dumps(
+                    {
+                        "data": {
+                            "status": 2,
+                            "format": audio_format,
+                            "encoding": "raw",
+                            "audio": "",
+                        }
                     }
-                },
-            }
-            ws.send(json.dumps(last_frame))
-
-    def _receive_results(self, ws: websocket.WebSocket) -> str:
-        """接收识别结果，处理动态修正（wpgs）并拼接最终文本。"""
-        result_parts: list[str] = []
-        while True:
-            try:
-                message = ws.recv()
-            except websocket.WebSocketTimeoutException:
-                raise ASRError("等待识别结果超时")
-            
-            if isinstance(message, bytes):
-                message = message.decode("utf-8")
-
-            data = json.loads(message)
-            header = data.get("header", {})
-            code = header.get("code")
-            if code != 0:
-                raise ASRError(
-                    f"识别错误: code={code}, message={header.get('message', '未知错误')}"
                 )
+            )
 
-            status = header.get("status")
-            payload = data.get("payload", {})
-            result = payload.get("result", {})
+    def _merge_result(self, result: dict, result_map: dict[int, str]) -> None:
+        """
+        把一片识别结果并入 result_map，处理动态修正（wpgs）。
 
-            if "text" in result:
-                text_b64 = result["text"]
-                text_json = base64.b64decode(text_b64).decode("utf-8")
-                text_data = json.loads(text_json)
+        - pgs="apd"：追加，直接以 sn 存入；
+        - pgs="rpl"：替换 rg=[start, end] 范围内的历史分片，再存入当前 sn。
+        未开 wpgs 时没有 pgs 字段，按追加处理。
+        """
+        sn = result.get("sn")
+        if sn is None:
+            return
 
-                partial = self._extract_text(text_data)
-                pgs = text_data.get("pgs")
+        text = self._extract_text(result)
 
-                if pgs == "rpl":
-                    # 替换前面若干段结果
-                    rg = text_data.get("rg", [1, len(result_parts)])
-                    start, end = max(0, rg[0] - 1), max(0, rg[1])
-                    result_parts = result_parts[:start]
-                    result_parts.append(partial)
-                else:
-                    # apd 或普通结果，直接追加
-                    result_parts.append(partial)
+        if result.get("pgs") == "rpl":
+            rg = result.get("rg")
+            if rg and len(rg) == 2:
+                for i in range(rg[0], rg[1] + 1):
+                    result_map.pop(i, None)
 
-            if status == 2:
-                return "".join(result_parts)
+        result_map[sn] = text
 
-    def _extract_text(self, text_data: dict) -> str:
-        """从 text 字段解码后的 JSON 中提取字词文本。"""
+    def _extract_text(self, result: dict) -> str:
+        """从一片结果的 ws 字段提取字词文本。"""
         words = []
-        for ws_item in text_data.get("ws", []):
+        for ws_item in result.get("ws", []):
             for cw in ws_item.get("cw", []):
                 w = cw.get("w")
                 if w:
@@ -355,8 +378,10 @@ _PROVIDERS = {
 def get_asr_provider(settings: Settings) -> ASRProvider:
     """根据配置返回 ASR provider 实例。"""
     provider_name = settings.asr_provider
+    logger.info(f"[ASR Factory] provider_name={provider_name!r}")
 
     if provider_name == "xunfei":
+        logger.info("[ASR Factory] Creating XunfeiASRProvider")
         return XunfeiASRProvider(
             app_id=settings.asr_api_key or "",
             api_key=settings.asr_api_secret or "",
@@ -364,4 +389,5 @@ def get_asr_provider(settings: Settings) -> ASRProvider:
         )
 
     # 回退到 mock
+    logger.info("[ASR Factory] Creating MockASRProvider")
     return MockASRProvider()
